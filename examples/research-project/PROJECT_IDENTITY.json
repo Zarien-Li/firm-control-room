@@ -1,0 +1,15 @@
+{
+  "project_id": "project-alpha-v1",
+  "identity_version": "v1-sealed",
+  "origin": {
+    "research_object": "Replace this with the stable research object.",
+    "value_metric": "Replace this with the primary value metric."
+  },
+  "outside_scope": [],
+  "current": {
+    "research_object": "Replace this with the current research object."
+  },
+  "transition_authority": {
+    "status": "user_approved"
+  }
+}

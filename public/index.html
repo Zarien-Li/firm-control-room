@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>FIRM Control Room</title>
+  <link rel="stylesheet" href="/vendor/xterm.css">
+  <link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">F</span>
+      <div>
+        <h1>FIRM Control Room</h1>
+        <p id="session-status">固定策略自动化 · 科学决策仍属于 PI</p>
+      </div>
+    </div>
+    <div class="top-actions">
+      <button id="automation-cycle" class="secondary compact">同步 GPU 队列</button>
+      <button id="semantic-scan" class="secondary compact">Codex 巡检</button>
+      <button id="scan" class="secondary compact">刷新状态</button>
+    </div>
+  </header>
+  <main>
+    <section class="overview">
+      <div class="section-title">
+        <div><h2>Research Portfolio</h2><span id="updated">等待首次扫描</span></div>
+        <div class="portfolio-actions">
+          <span>每 2.5 小时无状态差分巡检 · 默认人工确认纠偏</span>
+          <button id="toggle-idle" class="secondary compact" hidden>显示 IDLE</button>
+        </div>
+      </div>
+      <div class="summary" id="summary" aria-live="polite"></div>
+      <div class="project-board" id="projects"></div>
+    </section>
+    <section class="professor-band" id="professor-band" aria-live="polite">
+      <div class="professor-identity">
+        <span class="professor-mark">CX</span>
+        <div><strong>Codex Professor Engine</strong><small>无持久 session · 权威优先 · 只在证据变化时调用</small></div>
+      </div>
+      <div class="professor-state"><span id="professor-live-state">正在读取状态…</span><small id="professor-summary">每次从隔离证据重新判断</small></div>
+      <div class="professor-actions" id="professor-actions"></div>
+      <div class="professor-projects" id="professor-projects"></div>
+    </section>
+    <section class="intervention-band" id="intervention-section" hidden>
+      <div class="section-title"><h2>待确认重锚</h2><span>Codex 只识别边界，消息由固定模板生成</span></div>
+      <div class="interventions" id="interventions"></div>
+    </section>
+    <section class="scheduler-band" id="scheduler-band" aria-live="polite"></section>
+    <section class="automation-board">
+      <div class="section-title">
+        <div><h2>GPU Governor</h2><span id="gpu-queue-updated">等待远端队列</span></div>
+        <span>阶段感知遥测 · 低利用率只触发诊断，不自动停卡</span>
+      </div>
+      <div class="queue-layout">
+        <div class="queue-counts" id="gpu-queue-counts"></div>
+        <div class="queue-items" id="gpu-queue-items"></div>
+      </div>
+    </section>
+    <section class="automation-inbox" id="automation-inbox-section" hidden>
+      <div class="section-title"><h2>Automation Inbox</h2><span>未能安全自动投递的操作事件</span></div>
+      <div class="automation-events" id="automation-events"></div>
+    </section>
+    <section class="workspace">
+      <div class="workspace-bar">
+        <div>
+          <strong>Claude Sessions</strong>
+          <span>只运行研究项目与 GPU Scheduler；Codex Professor 不保留会话</span>
+        </div>
+        <div class="launcher">
+          <label><span class="sr-only">项目</span><select id="project-select"></select></label>
+          <input id="terminal-cols" type="hidden" value="120">
+          <input id="terminal-rows" type="hidden" value="32">
+        <button id="start-session">启动 Claude</button>
+        </div>
+      </div>
+      <div class="terminal-layout">
+        <div class="managed-sessions" id="managed-sessions"></div>
+        <div class="terminal-panel">
+          <div class="terminal-toolbar">
+            <strong id="terminal-title">选择一个 session</strong>
+            <button id="bootstrap-session" class="secondary" disabled>发送启动 Prompt</button>
+            <button id="interrupt-session" class="secondary" disabled>中断当前动作</button>
+            <button id="stop-session" class="danger" disabled>停止</button>
+          </div>
+          <div id="terminal" aria-label="Claude Code terminal"></div>
+        </div>
+      </div>
+    </section>
+    <details class="governance">
+      <summary>
+        <span>研究治理详情</span>
+        <small>进程、文件哈希与规则检查</small>
+      </summary>
+      <div class="governance-content">
+        <section>
+          <div class="section-title"><h2>外部 Sessions</h2><span>按 cwd 自动映射</span></div>
+          <div class="sessions" id="observed-sessions"></div>
+        </section>
+        <section>
+          <div class="section-title"><h2>治理审计</h2><span>只读 · 不做科学裁决</span></div>
+          <div class="findings" id="findings"></div>
+        </section>
+        <section>
+          <div class="section-title"><h2>最近证据</h2><span>SHA-256</span></div>
+          <div class="history" id="history"></div>
+        </section>
+      </div>
+    </details>
+  </main>
+  <script src="/vendor/xterm.js"></script>
+  <script src="/vendor/addon-fit.js"></script>
+  <script src="/app.js" type="module"></script>
+</body>
+</html>

@@ -1,0 +1,51 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "verdict",
+    "drift_type",
+    "evidence",
+    "reanchor_requirements",
+    "confidence",
+    "summary"
+  ],
+  "properties": {
+    "verdict": {
+      "type": "string",
+      "enum": ["PASS", "WARN", "INTERVENE"]
+    },
+    "drift_type": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["scope", "identity", "evidence", "compute", "operation"]
+      }
+    },
+    "evidence": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["source", "quote", "reason"],
+        "properties": {
+          "source": { "type": "string", "maxLength": 200 },
+          "quote": { "type": "string", "maxLength": 1200 },
+          "reason": { "type": "string", "maxLength": 800 }
+        }
+      }
+    },
+    "reanchor_requirements": {
+      "type": "array",
+      "maxItems": 3,
+      "items": { "type": "string", "maxLength": 800 }
+    },
+    "confidence": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1
+    },
+    "summary": { "type": "string", "maxLength": 1200 }
+  }
+}

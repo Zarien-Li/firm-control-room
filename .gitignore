@@ -1,0 +1,10 @@
+node_modules/
+var/
+work/
+coverage/
+config/projects.json
+.env
+.env.*
+!.env.example
+*.log
+.DS_Store

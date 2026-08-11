@@ -1,0 +1,42 @@
+{
+  "name": "firm-control-room",
+  "version": "0.1.0",
+  "description": "A local control plane for running, observing, and safely steering multiple Claude Code research sessions.",
+  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Zarien-Li/firm-control-room.git"
+  },
+  "homepage": "https://github.com/Zarien-Li/firm-control-room#readme",
+  "bugs": "https://github.com/Zarien-Li/firm-control-room/issues",
+  "keywords": [
+    "claude-code",
+    "codex",
+    "research-agents",
+    "agent-orchestration",
+    "gpu-scheduling"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=26"
+  },
+  "scripts": {
+    "start": "node src/start.js",
+    "start:web": "node src/server.js",
+    "start:broker": "node src/broker.js",
+    "dev": "FIRM_DEV=1 node --watch src/server.js",
+    "doctor": "node scripts/doctor.js",
+    "check": "node --check src/start.js && node --check src/broker.js && node --check src/broker-rpc.js && node --check src/broker-client.js && node --check src/server.js && node --check src/session-manager.js && node --check src/pty-backend.js && node --check src/config.js && node --check src/collectors.js && node --check src/iterm-status.js && node --check src/claude-history.js && node --check src/session-state.js && node --check src/audit.js && node --check src/semantic-audit.js && node --check src/gpu-queue.js && node --check src/automation-engine.js && node --check src/store.js && node --check src/evidence.js && node --check public/app.js && node --check scripts/smoke.js && node --check scripts/restart-acceptance.js && node --check scripts/soak.js",
+    "test": "node --test",
+    "smoke": "node scripts/smoke.js",
+    "acceptance:restart": "node scripts/restart-acceptance.js",
+    "soak": "node scripts/soak.js"
+  },
+  "dependencies": {
+    "@xterm/addon-fit": "^0.10.0",
+    "@xterm/xterm": "^5.5.0",
+    "node-pty": "^1.1.0",
+    "ws": "^8.18.3"
+  }
+}

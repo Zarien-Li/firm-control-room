@@ -1,0 +1,12 @@
+[
+  {
+    "id": "project-alpha",
+    "name": "Project Alpha",
+    "path": "${RESEARCH_PROJECT_ROOT}/project-alpha",
+    "sessionPathAliases": [],
+    "expected": {
+      "identityPrefix": "project-alpha",
+      "sessionContains": "project-alpha"
+    }
+  }
+]

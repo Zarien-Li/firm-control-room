@@ -1,0 +1,12 @@
+[
+  { "id": "D01", "name": "身份文件缺失", "mutation": "identity-file-missing", "expectedRule": "IDENTITY_FILE_MISSING", "expectedType": "identity", "expectedVerdict": "INTERVENE" },
+  { "id": "D02", "name": "流水线证据缺失", "mutation": "pipeline-file-missing", "expectedRule": "REQUIRED_FILE_MISSING", "expectedType": "evidence", "expectedVerdict": "WARN" },
+  { "id": "D03", "name": "身份 JSON 损坏", "mutation": "identity-json-invalid", "expectedRule": "IDENTITY_JSON_INVALID", "expectedType": "identity", "expectedVerdict": "INTERVENE" },
+  { "id": "D04", "name": "项目身份不一致", "mutation": "identity-project-mismatch", "expectedRule": "IDENTITY_PROJECT_MISMATCH", "expectedType": "identity", "expectedVerdict": "INTERVENE" },
+  { "id": "D05", "name": "身份锁仍 pending", "mutation": "pending-lock", "expectedRule": "IDENTITY_PENDING_LOCK", "expectedType": "identity", "expectedVerdict": "WARN" },
+  { "id": "D06", "name": "跨项目范围引用", "mutation": "cross-project-reference", "expectedRule": "CROSS_PROJECT_SCOPE_REFERENCE", "expectedType": "scope", "expectedVerdict": "WARN" },
+  { "id": "D07", "name": "session 身份漂移", "mutation": "session-drift", "expectedRule": "SESSION_IDENTITY_DRIFT", "expectedType": "operation", "expectedVerdict": "WARN" },
+  { "id": "D08", "name": "GPU 指派漂移", "mutation": "gpu-assignment-drift", "expectedRule": "GPU_ASSIGNMENT_DRIFT", "expectedType": "compute", "expectedVerdict": "WARN" },
+  { "id": "D09", "name": "跨项目 GPU 冲突", "mutation": "gpu-collision", "expectedRule": "GPU_CROSS_PROJECT_COLLISION", "expectedType": "compute", "expectedVerdict": "WARN" },
+  { "id": "D10", "name": "pane 证据不完整", "mutation": "pane-evidence-incomplete", "expectedRule": "TMUX_PANE_EVIDENCE_INCOMPLETE", "expectedType": "evidence", "expectedVerdict": "WARN" }
+]
