@@ -15,8 +15,8 @@ jobs:
       # suite injects fake PTYs and never launches the real Claude CLI.
       FIRM_CLAUDE_EXECUTABLE: /usr/bin/true
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: 26
           cache: npm
