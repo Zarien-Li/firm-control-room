@@ -10,6 +10,10 @@ permissions:
 jobs:
   test:
     runs-on: macos-latest
+    env:
+      # Configuration validation requires an executable path, while the test
+      # suite injects fake PTYs and never launches the real Claude CLI.
+      FIRM_CLAUDE_EXECUTABLE: /usr/bin/true
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
