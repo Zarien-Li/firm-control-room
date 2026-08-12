@@ -300,3 +300,30 @@ test('SessionManager only enters WAITING_INPUT after an explicit interactive pro
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('SessionManager wakes a managed Claude session when its provider limit resets', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-session-rate-limit-'));
+  const pty = new FakePty();
+  const now = new Date('2026-08-11T16:17:27.900Z');
+  const manager = new SessionManager({
+    projects: [{ id: 'GPU_SCHEDULER', name: 'GPU Scheduler', path: root }],
+    executable: '/fixed/claude',
+    controlDir: join(root, 'control'),
+    pty,
+    now: () => now,
+  });
+  try {
+    await manager.start('GPU_SCHEDULER');
+    pty.terminals[0].emitData(
+      'API Error: Request rejected (429) · 已达到 5小时的使用上限。您的限额将在 2026-08-1200:17:28重置。',
+    );
+    assert.equal(manager.list()[0].status, 'RATE_LIMITED');
+    assert.equal(manager.list()[0].rateLimitResetAt, '2026-08-11T16:17:28.000Z');
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.equal(manager.list()[0].status, 'WAITING_INPUT');
+    assert.equal(manager.list()[0].waitReason, 'provider_rate_limit_reset_elapsed');
+  } finally {
+    await manager.close({ terminate: true });
+    await rm(root, { recursive: true, force: true });
+  }
+});

@@ -84,6 +84,15 @@ export async function createStore(dataDir) {
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
+    CREATE TABLE IF NOT EXISTS project_progress (
+      target_id TEXT PRIMARY KEY,
+      stage TEXT NOT NULL DEFAULT '',
+      summary TEXT NOT NULL,
+      reviewed_at TEXT NOT NULL,
+      source TEXT NOT NULL DEFAULT 'portfolio-review',
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
     CREATE TABLE IF NOT EXISTS message_outbox (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       message_key TEXT NOT NULL UNIQUE,
@@ -126,6 +135,47 @@ export async function createStore(dataDir) {
     );
     CREATE INDEX IF NOT EXISTS session_episodes_target_idx
       ON session_episodes(target_id, last_seen_at DESC);
+    CREATE TABLE IF NOT EXISTS jobs (
+      run_id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL,
+      kind TEXT NOT NULL,
+      executor TEXT NOT NULL,
+      state TEXT NOT NULL,
+      host TEXT,
+      pid INTEGER,
+      pid_start_token TEXT,
+      command_fingerprint TEXT,
+      purpose TEXT NOT NULL DEFAULT '',
+      submitted_at TEXT NOT NULL,
+      started_at TEXT,
+      heartbeat_at TEXT,
+      finished_at TEXT,
+      progress_json TEXT,
+      result_json TEXT,
+      metadata_json TEXT,
+      source TEXT NOT NULL,
+      revision INTEGER NOT NULL DEFAULT 1,
+      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
+    CREATE INDEX IF NOT EXISTS jobs_project_state_idx
+      ON jobs(project_id, state, updated_at DESC);
+    CREATE TABLE IF NOT EXISTS job_events (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      event_key TEXT NOT NULL UNIQUE,
+      run_id TEXT NOT NULL,
+      event_type TEXT NOT NULL,
+      from_state TEXT,
+      to_state TEXT,
+      at TEXT NOT NULL,
+      payload_json TEXT,
+      FOREIGN KEY(run_id) REFERENCES jobs(run_id)
+    );
+    CREATE INDEX IF NOT EXISTS job_events_run_idx ON job_events(run_id, id ASC);
+    CREATE TABLE IF NOT EXISTS system_migrations (
+      migration_key TEXT PRIMARY KEY,
+      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+    );
   `);
   const outboxColumns = new Set(db.prepare('PRAGMA table_info(message_outbox)').all()
     .map((column) => column.name));
@@ -158,7 +208,38 @@ export async function createStore(dataDir) {
     SET status = 'UNCERTAIN', updated_at = CURRENT_TIMESTAMP,
         error = COALESCE(error, 'process_restarted_during_transport_send')
     WHERE status = 'SENDING';
+
+    DELETE FROM job_events
+    WHERE event_type = 'updated'
+      AND id NOT IN (
+        SELECT MAX(id) FROM job_events WHERE event_type = 'updated' GROUP BY run_id
+      );
   `);
+  const singleTrackMigration = db.prepare(`
+    SELECT migration_key FROM system_migrations
+    WHERE migration_key = 'single_track_job_registry_v1'
+  `).get();
+  if (!singleTrackMigration) {
+    db.exec(`
+      BEGIN IMMEDIATE;
+      UPDATE automation_events
+      SET status = 'RESOLVED', updated_at = CURRENT_TIMESTAMP,
+          note = 'superseded_by_single_track_job_registry_migration'
+      WHERE event_type IN ('GPU_RESULT_READY', 'GPU_WAIT_ACCEPTED')
+        AND status IN ('PENDING', 'HELD', 'SENT');
+      UPDATE message_outbox
+      SET status = 'SUPERSEDED', updated_at = CURRENT_TIMESTAMP,
+          error = 'superseded_by_single_track_job_registry_migration'
+      WHERE status = 'UNCERTAIN'
+         OR automation_event_id IN (
+           SELECT id FROM automation_events
+           WHERE event_type IN ('GPU_RESULT_READY', 'GPU_WAIT_ACCEPTED')
+         );
+      INSERT INTO system_migrations (migration_key)
+      VALUES ('single_track_job_registry_v1');
+      COMMIT;
+    `);
+  }
   const insert = db.prepare(`
     INSERT INTO scans (collected_at, snapshot_json, audit_json, evidence_hash, evidence_path)
     VALUES (?, ?, ?, ?, ?)
@@ -257,6 +338,22 @@ export async function createStore(dataDir) {
   const getAutomationPolicy = db.prepare(`
     SELECT * FROM automation_policies WHERE target_id = ?
   `);
+  const upsertProjectProgress = db.prepare(`
+    INSERT INTO project_progress (target_id, stage, summary, reviewed_at, source)
+    VALUES (?, ?, ?, ?, ?)
+    ON CONFLICT(target_id) DO UPDATE SET
+      stage = excluded.stage,
+      summary = excluded.summary,
+      reviewed_at = excluded.reviewed_at,
+      source = excluded.source,
+      updated_at = CURRENT_TIMESTAMP
+  `);
+  const getProjectProgress = db.prepare(`
+    SELECT * FROM project_progress WHERE target_id = ?
+  `);
+  const listProjectProgress = db.prepare(`
+    SELECT * FROM project_progress ORDER BY target_id ASC
+  `);
   const recentGoalActions = db.prepare(`
     SELECT COUNT(*) AS count, MAX(delivered_at) AS last_delivered_at
     FROM automation_events
@@ -329,6 +426,49 @@ export async function createStore(dataDir) {
   const listSessionEpisodes = db.prepare(`
     SELECT * FROM session_episodes ORDER BY last_seen_at DESC LIMIT ?
   `);
+  const upsertJob = db.prepare(`
+    INSERT INTO jobs
+      (run_id, project_id, kind, executor, state, host, pid, pid_start_token,
+       command_fingerprint, purpose, submitted_at, started_at, heartbeat_at,
+       finished_at, progress_json, result_json, metadata_json, source, revision)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(run_id) DO UPDATE SET
+      project_id=excluded.project_id, kind=excluded.kind, executor=excluded.executor,
+      state=excluded.state, host=excluded.host, pid=excluded.pid,
+      pid_start_token=excluded.pid_start_token,
+      command_fingerprint=excluded.command_fingerprint, purpose=excluded.purpose,
+      submitted_at=excluded.submitted_at, started_at=excluded.started_at,
+      heartbeat_at=excluded.heartbeat_at, finished_at=excluded.finished_at,
+      progress_json=excluded.progress_json, result_json=excluded.result_json,
+      metadata_json=excluded.metadata_json, source=excluded.source,
+      revision=excluded.revision, updated_at=CURRENT_TIMESTAMP
+  `);
+  const getJob = db.prepare('SELECT * FROM jobs WHERE run_id = ?');
+  const listJobs = db.prepare('SELECT * FROM jobs ORDER BY updated_at DESC, run_id DESC LIMIT ?');
+  const listActiveJobs = db.prepare(`
+    SELECT * FROM jobs WHERE state IN ('pending', 'running')
+    ORDER BY updated_at DESC, run_id DESC
+  `);
+  const listTerminalJobs = db.prepare(`
+    SELECT * FROM jobs WHERE state IN ('done', 'failed', 'cancelled')
+    ORDER BY COALESCE(finished_at, updated_at) DESC, run_id DESC LIMIT ?
+  `);
+  const listTerminalJobsAfter = db.prepare(`
+    SELECT * FROM jobs
+    WHERE state IN ('done', 'failed', 'cancelled')
+      AND (COALESCE(finished_at, updated_at) < ?
+        OR (COALESCE(finished_at, updated_at) = ? AND run_id < ?))
+    ORDER BY COALESCE(finished_at, updated_at) DESC, run_id DESC LIMIT ?
+  `);
+  const countJobsByState = db.prepare(`
+    SELECT state, COUNT(*) AS count FROM jobs GROUP BY state
+  `);
+  const insertJobEvent = db.prepare(`
+    INSERT OR IGNORE INTO job_events
+      (event_key, run_id, event_type, from_state, to_state, at, payload_json)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `);
+  const listJobEvents = db.prepare('SELECT * FROM job_events WHERE run_id = ? ORDER BY id ASC');
 
   function semanticRow(row) {
     if (!row) return null;
@@ -394,6 +534,19 @@ export async function createStore(dataDir) {
     };
   }
 
+  function projectProgressRow(row) {
+    if (!row) return null;
+    return {
+      targetId: row.target_id,
+      stage: row.stage,
+      summary: row.summary,
+      reviewedAt: row.reviewed_at,
+      source: row.source,
+      createdAt: row.created_at,
+      updatedAt: row.updated_at,
+    };
+  }
+
   function outboxRow(row) {
     if (!row) return null;
     return {
@@ -434,6 +587,23 @@ export async function createStore(dataDir) {
       firstSeenAt: row.first_seen_at,
       lastSeenAt: row.last_seen_at,
       source: row.source_json ? JSON.parse(row.source_json) : null,
+    };
+  }
+
+  function jobRow(row) {
+    if (!row) return null;
+    return {
+      runId: row.run_id, projectId: row.project_id, kind: row.kind,
+      executor: row.executor, state: row.state, host: row.host,
+      pid: row.pid === null ? null : Number(row.pid), pidStartToken: row.pid_start_token,
+      commandFingerprint: row.command_fingerprint, purpose: row.purpose,
+      submittedAt: row.submitted_at, startedAt: row.started_at,
+      heartbeatAt: row.heartbeat_at, finishedAt: row.finished_at,
+      progress: row.progress_json ? JSON.parse(row.progress_json) : null,
+      result: row.result_json ? JSON.parse(row.result_json) : null,
+      metadata: row.metadata_json ? JSON.parse(row.metadata_json) : {},
+      source: row.source, revision: Number(row.revision),
+      createdAt: row.created_at, updatedAt: row.updated_at,
     };
   }
 
@@ -610,6 +780,16 @@ export async function createStore(dataDir) {
     listAutomationPolicies() {
       return listAutomationPolicies.all().map(automationPolicyRow);
     },
+    setProjectProgress(targetId, { stage = '', summary, reviewedAt, source }) {
+      upsertProjectProgress.run(targetId, stage, summary, reviewedAt, source);
+      return projectProgressRow(getProjectProgress.get(targetId));
+    },
+    getProjectProgress(targetId) {
+      return projectProgressRow(getProjectProgress.get(targetId));
+    },
+    listProjectProgress() {
+      return listProjectProgress.all().map(projectProgressRow);
+    },
     recentGoalActions(targetId, since) {
       const row = recentGoalActions.get(targetId, since);
       return {
@@ -686,6 +866,47 @@ export async function createStore(dataDir) {
     listSessionEpisodes(limit = 100) {
       return listSessionEpisodes.all(Math.max(1, Math.min(Number(limit) || 100, 1000)))
         .map(sessionEpisodeRow);
+    },
+    saveJob(job) {
+      upsertJob.run(
+        job.runId, job.projectId, job.kind, job.executor, job.state,
+        job.host ?? null, job.pid ?? null, job.pidStartToken ?? null,
+        job.commandFingerprint ?? null, job.purpose || '', job.submittedAt,
+        job.startedAt ?? null, job.heartbeatAt ?? null, job.finishedAt ?? null,
+        job.progress ? JSON.stringify(job.progress) : null,
+        job.result ? JSON.stringify(job.result) : null,
+        JSON.stringify(job.metadata || {}), job.source, job.revision || 1,
+      );
+      return jobRow(getJob.get(job.runId));
+    },
+    getJob(runId) { return jobRow(getJob.get(runId)); },
+    listJobs(limit = 1000) {
+      return listJobs.all(Math.max(1, Math.min(Number(limit) || 1000, 5000))).map(jobRow);
+    },
+    listActiveJobs() { return listActiveJobs.all().map(jobRow); },
+    listTerminalJobs({ limit = 25, cursor = null } = {}) {
+      const bounded = Math.max(1, Math.min(Number(limit) || 25, 200));
+      const rows = cursor
+        ? listTerminalJobsAfter.all(cursor.updatedAt, cursor.updatedAt, cursor.runId, bounded + 1)
+        : listTerminalJobs.all(bounded + 1);
+      return { items: rows.slice(0, bounded).map(jobRow), hasMore: rows.length > bounded };
+    },
+    countJobsByState() {
+      return countJobsByState.all().map((row) => ({ state: row.state, count: Number(row.count) }));
+    },
+    addJobEvent(event) {
+      insertJobEvent.run(
+        event.eventKey, event.runId, event.eventType, event.fromState ?? null,
+        event.toState ?? null, event.at,
+        event.payload ? JSON.stringify(event.payload) : null,
+      );
+    },
+    listJobEvents(runId) {
+      return listJobEvents.all(runId).map((row) => ({
+        id: Number(row.id), eventKey: row.event_key, runId: row.run_id,
+        eventType: row.event_type, fromState: row.from_state, toState: row.to_state,
+        at: row.at, payload: row.payload_json ? JSON.parse(row.payload_json) : null,
+      }));
     },
     close() {
       db.close();

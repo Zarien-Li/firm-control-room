@@ -25,7 +25,7 @@ FIRM turns those hidden states into an evidence-backed control plane. It combine
 
 | Without a control plane | With FIRM |
 |---|---|
-| A prompt is visible, but you cannot tell whether Claude stopped or a tool is still draining | Explicit states such as `MODEL_WORKING`, `TOOL_RUNNING`, `WAITING_FOR_GPU`, and `WAITING_REVIEW` |
+| A prompt is visible, but you cannot tell whether Claude stopped or a tool is still draining | Explicit states such as `MODEL_WORKING`, `TOOL_RUNNING`, `WAITING_FOR_JOB`, and `WAITING_REVIEW` |
 | “Continue” messages may be pasted twice or never submitted | Durable outbox, unique delivery markers, and Claude-history acknowledgement |
 | A long-running session gradually replaces the original research program | Read-only evidence snapshots plus isolated Codex boundary audits |
 | A reviewer agent starts inventing extra experiments and steering the PI | Codex may identify scope drift, but cannot choose methods, claims, pivots, or GPU actions |
@@ -129,7 +129,7 @@ That distinction matters. A spinner with no history, artifact, or tool progress 
 
 ### Safe continuation
 
-Goal Loop is off until you explicitly enable it for a project and provide an objective. It only submits at a verified normal input prompt, never answers permission or destructive-action confirmations, respects pending interventions and high-priority events, and enforces a rolling daily continuation limit.
+Automatic Goal Loop injection is globally off by default. Routine Claude choice menus are still resolved, human-owned permission prompts are left to the user, and GPU terminal events remain event-driven. Enabling a stored project policy has no effect unless the separate global `FIRM_GOAL_LOOP_ENABLED` switch is deliberately enabled.
 
 An external iTerm message is not considered delivered merely because AppleScript pasted it. The Claude history must contain its unique `[FIRM DELIVERY ...]` marker. Uncertain sends are exposed instead of retried blindly.
 
@@ -137,9 +137,23 @@ An external iTerm message is not considered delivered merely because AppleScript
 
 Codex is invoked as a short-lived, read-only boundary auditor, not a permanent co-PI session. Each audit starts from project authority and recent bounded evidence. It may flag identity, scope, evidence, compute, or operational drift. It may not prescribe a method, add a baseline, invent a paper framing, or turn ordinary uncertainty into a stop decision.
 
+For deployments that use a separate portfolio-review scheduler, set `FIRM_SCAN_INTERVAL_MS=0` and `FIRM_CODEX_AUDIT_ENABLED=false`. This leaves FIRM responsible for session liveness, structured job state, and operational events while the external scheduler remains the single owner of periodic scientific review. Manual audit endpoints remain available when explicitly enabled.
+
 The default re-anchor mode is `approval`: high-confidence, grounded interventions enter an inbox and wait for a human decision.
 
-## Optional GPU queue
+## FIRM Job Registry
+
+FIRM does not infer long-task truth from terminal prose, GPU utilization, or a temporarily quiet log. Every long-running GPU, local CPU, remote CPU, or SSH task has one durable `runId` and an explicit lifecycle: `pending -> running -> done | failed | cancelled`. Unknown liveness is observability metadata and never changes that lifecycle.
+
+GPU requests enter the registry automatically through the existing queue. Other jobs use:
+
+```bash
+scripts/run-registered-job.sh RUN_ID PROJECT_ID local_cpu -- command arg...
+scripts/run-registered-job.sh RUN_ID PROJECT_ID remote_cpu -- ssh host command...
+scripts/run-registered-job.sh RUN_ID PROJECT_ID ssh -- ssh host command...
+```
+
+The API is available at `GET /api/jobs`, `POST /api/jobs`, and `POST /api/jobs/:runId/status`. The default list returns every active job plus the 25 most recently updated terminal jobs. Follow `page.nextCursor` with `?view=history&limit=25&cursor=...` to page through complete terminal history. Registered process updates are bound to PID, operating-system process start token, and an argv fingerprint, preventing PID reuse or a different command from claiming the same run. A research session waiting on authoritative work emits the single accepted marker `[FIRM WAITING_FOR_JOB run_id=<run_id>]`.
 
 The local research dashboard works with GPU integration disabled, which is the public default. To connect your own SSH-accessible queue:
 
@@ -160,10 +174,10 @@ pending/.submitted → running/.started → done|failed|cancelled/.ready
 
 Before enabling it, adapt the operational templates in `config/` to your scheduler and place the required scheduler governance files in the projects' common parent directory. FIRM only reads queue state over a fixed SSH collector. Your scheduler remains the sole owner of worker launch and termination.
 
-An accepted GPU wait requires both:
+An accepted registered-job wait requires both:
 
-- the latest Claude assistant event declares `[FIRM WAITING_FOR_GPU run_id=<run_id>]`; and
-- the authoritative queue independently shows the same project-owned run as `pending` or `running`.
+- the latest Claude assistant event declares `[FIRM WAITING_FOR_JOB run_id=<run_id>]`; and
+- the Job Registry independently shows the same project-owned run as `pending` or `running`.
 
 Completed, failed, missing, cross-project, or merely planned jobs never suppress liveness review.
 
@@ -180,9 +194,13 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 | `FIRM_CODEX_AUDIT_ENABLED` | `true` | Enable isolated Codex audits |
 | `FIRM_SCAN_INTERVAL_MS` | `9000000` | Periodic audit interval (2.5 hours) |
 | `FIRM_REANCHOR_MODE` | `approval` | `off`, `approval`, or `auto` |
+| `FIRM_GOAL_LOOP_ENABLED` | `false` | Global kill switch for generic automatic continuation |
 | `FIRM_GOAL_MAX_CONTINUES_PER_DAY` | `48` | Hard rolling 24-hour continuation limit per project |
 | `FIRM_GPU_QUEUE_ENABLED` | `false` | Enable remote queue collection |
 | `FIRM_GPU_SCHEDULER_AUTO_START` | `false` | Allow a configured scheduler target to start for new requests |
+| `FIRM_GPU_QUEUE_DOCKER_CONTAINER` | none | Fixed container used by the optional queue adapter |
+| `FIRM_GPU_QUEUE_ROOT` | none | Absolute queue root inside the remote execution environment |
+| `FIRM_GPU_PROJECT_ROOT` | none | Allowed parent directory for submitted project commands |
 | `FIRM_DATA_DIR` | `./var` | Local runtime database, evidence, and transcripts |
 
 See [src/config.js](src/config.js) for all bounded timing and executable overrides.

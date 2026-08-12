@@ -65,12 +65,12 @@ export async function createBrokerServer({ socketPath, manager }) {
   await chmod(socketPath, 0o600);
   return {
     server,
-    async close() {
+    async close({ terminate = false } = {}) {
       await new Promise((resolve) => server.close(resolve));
       await unlink(socketPath).catch((error) => {
         if (error.code !== 'ENOENT') throw error;
       });
-      await manager.close();
+      await manager.close({ terminate });
     },
   };
 }

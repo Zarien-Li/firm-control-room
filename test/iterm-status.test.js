@@ -2,7 +2,9 @@ import assert from 'node:assert/strict';
 import test from 'node:test';
 import {
   classifyItermTail,
+  clearItermDraft,
   collectItermStatuses,
+  dismissItermChoice,
   sendItermMessage,
   submitItermDraft,
 } from '../src/iterm-status.js';
@@ -48,6 +50,29 @@ test('the newest terminal marker wins over stale monitor text', () => {
   ].join('\n');
   assert.deepEqual(classifyItermTail(oldPromptThenProgress), {
     state: 'WORKING', reason: 'active_progress_visible',
+  });
+});
+
+test('a 429 with a future reset time is a healthy rate-limit wait', () => {
+  const tail = [
+    'API Error: Request rejected (429) · [1308][已达到 5小时的使用上限。您的限额将在 2026-08-1200:17:28重置。',
+    '❯ ',
+    '────────────────────────',
+    '  ⏵⏵ auto mode on',
+  ].join('\n');
+  assert.deepEqual(classifyItermTail(tail, {
+    now: new Date('2026-08-11T16:00:00Z'),
+  }), {
+    state: 'RATE_LIMITED',
+    reason: 'api_rate_limit_wait',
+    resetAt: '2026-08-11T16:17:28.000Z',
+  });
+  assert.deepEqual(classifyItermTail(tail, {
+    now: new Date('2026-08-11T16:18:00Z'),
+  }), {
+    state: 'WAITING_INPUT',
+    reason: 'claude_input_prompt_visible',
+    lastRateLimitResetAt: '2026-08-11T16:17:28.000Z',
   });
 });
 
@@ -115,4 +140,83 @@ test('tracked prompt drafts expose their marker and support Enter-only retry', a
   assert.equal(calls.length, 1);
   assert.deepEqual(calls[0].argv, ['/dev/ttys019']);
   assert.ok(calls[0].lines.some((line) => /ASCII character 13/.test(line)));
+});
+
+test('multiline FIRM prompts are foreground drafts even when stale progress appears above them', () => {
+  assert.deepEqual(classifyItermTail([
+    '✳ Running an old monitor…',
+    '✻ Worked for 3h',
+    '❯ [FIRM DELIVERY',
+    '  firm-c7265dc5fe7a24c599265f5d]',
+    '  [FIRM OPERATIONAL EVENT — GPU RESULT]',
+    '  Read RESULT.md and continue.',
+    '────────────────────────────────',
+    '  ⏵⏵ auto mode on (shift+tab to cycle)',
+  ].join('\n')), {
+    state: 'DRAFT_PENDING_ENTER',
+    reason: 'firm_delivery_draft_visible',
+    draftDeliveryMarker: 'firm-c7265dc5fe7a24c599265f5d',
+  });
+});
+
+test('a FIRM draft can be submitted into Claude Code while the model is running', () => {
+  assert.deepEqual(classifyItermTail([
+    '✶ Building the current method…',
+    '❯ [FIRM DELIVERY firm-queued-result]',
+    '  A GPU result is ready.',
+    '────────────────────────────────',
+    '  ⏵⏵ auto mode on · esc to interrupt',
+  ].join('\n')), {
+    state: 'DRAFT_PENDING_ENTER',
+    reason: 'firm_delivery_draft_visible',
+    draftDeliveryMarker: 'firm-queued-result',
+    modelWorking: true,
+    acceptsQueuedInput: true,
+  });
+});
+
+test('ordinary Claude menus are distinct from human-owned confirmations', () => {
+  assert.deepEqual(classifyItermTail([
+    'How should I unblock it?',
+    '❯ 1. Start the GPU Scheduler (Recommended)',
+    '     Drain the existing queue.',
+    '  2. Keep waiting',
+    '  3. Type something.',
+    'Enter to select · ↑/↓ to navigate · Esc to cancel',
+  ].join('\n')), {
+    state: 'ROUTINE_CHOICE',
+    reason: 'claude_routine_choice_visible',
+    selectedOptionNumber: 1,
+    selectedOptionText: 'Start the GPU Scheduler (Recommended) Drain the existing queue.',
+    recommendedSelected: true,
+  });
+  assert.equal(classifyItermTail([
+    '❯ 1. Grant permission to delete the dataset (Recommended)',
+    '  2. Cancel',
+    'Enter to select · Esc to cancel',
+  ].join('\n')).state, 'CONFIRMATION');
+});
+
+test('draft clear and choice dismiss are separate terminal actions', async () => {
+  const calls = [];
+  const runWrite = async (lines, argv) => calls.push({ lines, argv });
+  await clearItermDraft('/dev/ttys019', { runWrite });
+  await dismissItermChoice('/dev/ttys019', { runWrite });
+  assert.equal(calls.length, 2);
+  assert.ok(calls[0].lines.some((line) => /ASCII character 3/.test(line)));
+  assert.ok(calls[1].lines.some((line) => /ASCII character 27/.test(line)));
+});
+
+test('collapsed bracketed paste is a draft that needs Enter, not a fresh prompt', () => {
+  assert.deepEqual(classifyItermTail([
+    'research status',
+    '❯ [Pasted text #1 +12 lines]',
+    '────────────────────────',
+    '  ⏵⏵ auto mode on',
+  ].join('\n')), {
+    state: 'DRAFT_PENDING_ENTER',
+    reason: 'collapsed_bracketed_paste_draft_visible',
+    draftDeliveryMarker: null,
+    collapsedPasteDraft: true,
+  });
 });

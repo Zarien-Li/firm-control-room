@@ -153,6 +153,7 @@ function validateAudit(value) {
   };
 }
 
+
 function normalizeEvidenceText(value) {
   return String(value || '').normalize('NFC').replace(/\r\n?/g, '\n').replace(/\s+/g, ' ').trim();
 }
@@ -304,6 +305,7 @@ export async function runCodexSemanticAudit({
     return { status: 'failed', packetHash, packetPath, resultPath: null, audit: null, error: error.message };
   }
 }
+
 
 export function buildReanchorPrompt(project, audit) {
   const driftTypes = [...new Set((audit.drift_type || []).filter((type) => DRIFT_TYPES.has(type)))];

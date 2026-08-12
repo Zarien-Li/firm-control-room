@@ -18,7 +18,7 @@ FIRM 把 Claude 历史、终端状态、进程树、项目产物、持久消息�
 
 | 原来的问题 | FIRM 的处理 |
 |---|---|
-| 看到提示符，却不知道 Claude 停了还是工具仍在收尾 | 显式区分 `MODEL_WORKING`、`TOOL_RUNNING`、`WAITING_FOR_GPU`、`WAITING_REVIEW` |
+| 看到提示符，却不知道 Claude 停了还是工具仍在收尾 | 显式区分 `MODEL_WORKING`、`TOOL_RUNNING`、`WAITING_FOR_JOB`、`WAITING_REVIEW` |
 | “继续”可能重复粘贴、没有按回车或没有进入 Claude 历史 | SQLite outbox、唯一消息标记和历史 ACK |
 | 长会话逐渐把原始研究问题换成局部叙事 | 只读证据快照与隔离的 Codex 边界审计 |
 | Codex 审查反过来发明实验、提高门槛和带偏主 PI | Codex 只能识别边界漂移，不能决定方法、主张、停止或 GPU 操作 |
@@ -88,12 +88,14 @@ FIRM_CODEX_AUDIT_ENABLED=false npm start
 - 权限确认、破坏性操作和无法证明的终端状态不会被自动回答；
 - FIRM 不允许网页执行任意 shell，不替 PI 选择方法或论文类型。
 
-## 合法等待 GPU
+## FIRM Job Registry
 
-一个项目只有同时满足以下条件才进入 `WAITING_FOR_GPU`：
+FIRM 不再从自然语言、GPU 利用率或暂时安静的日志猜测长任务状态。GPU、CPU、SSH 和本地长任务统一使用一个持久 `runId`，生命周期为 `pending → running → done | failed | cancelled`。
 
-1. Claude 最新 assistant 事件输出精确标记 `[FIRM WAITING_FOR_GPU run_id=<run_id>]`；
-2. 权威队列中同一项目、同一 run ID 确实为 `pending` 或 `running`。
+一个项目只有同时满足以下条件才进入 `WAITING_FOR_JOB`：
+
+1. Claude 最新 assistant 事件输出唯一有效标记 `[FIRM WAITING_FOR_JOB run_id=<run_id>]`；
+2. Job Registry 中同一项目、同一 run ID 确实为 `pending` 或 `running`。
 
 此时 Goal Loop 和停顿审查都会暂停。任务进入 `done`、`failed` 或 `cancelled` 后，FIRM 会把结果事件送回项目并恢复正常推进。失败任务、历史任务、其他项目任务和仅计划但未提交的任务都不能伪装成合法等待。
 
@@ -106,7 +108,9 @@ export FIRM_GPU_QUEUE_ENABLED=true
 export FIRM_GPU_SCHEDULER_AUTO_START=true
 export FIRM_GPU_QUEUE_HOST=user@gpu-control-host
 export FIRM_GPU_QUEUE_SSH_PORT=22
+export FIRM_GPU_QUEUE_DOCKER_CONTAINER=research-container
 export FIRM_GPU_QUEUE_ROOT=/absolute/remote/path/to/gpu_queue
+export FIRM_GPU_PROJECT_ROOT=/absolute/remote/path/to/projects
 npm start
 ```
 
@@ -127,7 +131,7 @@ npm run smoke
 npm run acceptance:restart
 ```
 
-测试覆盖 Web/broker 重启、延迟 ACK、发送中断、终端噪声、快速工作周期、采集器降级、GPU monitor 丢失、合法 GPU 等待和消息防重。
+测试覆盖 Web/broker 重启、延迟 ACK、发送中断、终端噪声、快速工作周期、采集器降级、GPU monitor 丢失、统一任务等待和消息防重。
 
 ## 安全提醒
 

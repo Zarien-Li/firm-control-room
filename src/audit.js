@@ -105,8 +105,9 @@ export function auditSnapshot(snapshot, now = new Date()) {
         'PROJECT_IDENTITY.json 无法解析', { reason: identity.reason, detail: identity.detail },
         '修复身份 JSON 语法后重新扫描');
     } else if (identity.status === 'ok') {
-      if (!identity.projectId || (expected.identityPrefix
-          && !String(identity.projectId).startsWith(expected.identityPrefix))) {
+      if (expected.identityPrefix
+          && (!identity.projectId
+            || !String(identity.projectId).startsWith(expected.identityPrefix))) {
         add(findings, 'IDENTITY_PROJECT_MISMATCH', 'critical', 'identity', project.id,
           '项目身份与配置槽位不一致',
           { expectedPrefix: expected.identityPrefix, actualProjectId: identity.projectId },

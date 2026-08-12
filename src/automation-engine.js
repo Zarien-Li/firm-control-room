@@ -1,9 +1,10 @@
 import { createHash } from 'node:crypto';
 import { collectGpuQueue, emptyGpuQueueSnapshot } from './gpu-queue.js';
-import { gpuWaitStatus } from './gpu-wait.js';
+import { JobRegistry } from './job-registry.js';
+import { jobWaitStatus } from './job-wait.js';
 import { probeSchedulerMonitor } from './scheduler-monitor.js';
 
-const ACTIVE_SESSION_STATES = new Set(['RUNNING', 'WAITING_INPUT']);
+const ACTIVE_SESSION_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'WAITING_INPUT']);
 const TERMINAL_QUEUE_STATES = new Set(['done', 'failed', 'cancelled']);
 
 function eventSeverity(state) {
@@ -21,6 +22,24 @@ function eventProject(item, projectIds) {
 
 function queuePrompt(event) {
   const item = event.source?.queueItem || {};
+  if (event.eventType === 'JOB_RESULT_READY') {
+    const job = event.source?.job || {};
+    return [
+      '[FIRM OPERATIONAL EVENT — REGISTERED JOB RESULT]',
+      `Job ${event.runId} reached authoritative state: ${job.state}`,
+      `Executor: ${job.executor || 'unknown'}; kind: ${job.kind || 'unknown'}`,
+      'Read the registered result and preserve raw evidence. This notification does not prescribe scientific interpretation or a new method.',
+    ].join('\n');
+  }
+  if (event.eventType === 'GPU_PREPARATION_REQUIRED') {
+    const readiness = item.submissionReadiness || { state: 'NOT_READY', missing: [] };
+    return [
+      '[FIRM OPERATIONAL EVENT — GPU PREPARATION REQUIRED]',
+      `Run: ${event.runId}`,
+      `Missing preparation evidence: ${(readiness.missing || []).join(', ') || 'unspecified'}`,
+      'Repair only the declared preparation defect, then resubmit through the canonical helper. Do not reinterpret the science or start a different experiment.',
+    ].join('\n');
+  }
   if (event.eventType === 'GPU_SCHEDULER_MONITOR_MISSING') {
     const health = event.source?.monitorHealth || {};
     return [
@@ -77,14 +96,48 @@ function automationPrompt(event) {
 
 function goalPrompt(policy) {
   return [
-    '[FIRM USER-APPROVED GOAL LOOP]',
-    `Continue autonomously toward this approved objective: ${policy.objective}`,
-    'From the project’s current trustworthy evidence and active research skills, execute a coherent sequence of high-value actions in this same turn; after each routine action, reassess and continue to the next independent action.',
-    'Do not broaden the sealed arena, invent a new user constraint, or turn a failed candidate into an analysis-paper identity.',
-    'Do not end the turn merely because one experiment, status update, request package, code repair, or evidence read is complete. Do not return a routine menu to the user.',
-    'If and only if every independent non-GPU action is complete and progress is blocked solely on an active project GPU request, end with the exact machine marker [FIRM WAITING_FOR_GPU run_id=<active_run_id>]. Never emit this marker for a failed, completed, missing, or merely planned request.',
-    'Stop only for a genuine permission, irreversible operation, exceptional resource request, or unresolved scientific ambiguity that requires PI input.',
+    '[FIRM USER-APPROVED CONTINUATION RESPONSE]',
+    'Resolve only the ordinary question or option in your immediately preceding message from evidence already present. Stay inside the current construction episode; do not begin a new method, call Codex, or restate the project objective because of this response.',
   ].join('\n');
+}
+
+function selfResolveChoicePrompt() {
+  return [
+    '[FIRM USER-APPROVED ROUTINE-CHOICE RESPONSE]',
+    'Your immediately preceding menu contains ordinary research or engineering alternatives, not a human-owned permission decision.',
+    'Using the evidence already in this session, choose the highest-value option yourself and execute it now. Do not return the same menu or ask the user to ratify a routine choice.',
+    'Do not reinterpret the paper identity, broaden scope, grant permissions, perform irreversible operations, or authorize exceptional resources through this response.',
+  ].join('\n');
+}
+
+function selfResolveQuestionPrompt() {
+  return [
+    '[FIRM USER-APPROVED ROUTINE-QUESTION RESPONSE]',
+    'Answer the ordinary research or engineering question in your immediately preceding message from evidence already in this session, choose the highest-value action, and execute it.',
+    'Stay inside any active construction episode. Do not begin a new method, call Codex, restate the project objective, or ask the user to ratify a routine decision because of this response.',
+    'If the question actually requires permission, an irreversible action, exceptional resources, or a user-owned change of scope or contribution type, state only that concrete boundary and wait.',
+  ].join('\n');
+}
+
+function routineQuestion(text) {
+  const value = String(text || '')
+    .replace(/\[FIRM (?:WAITING_FOR_JOB|CONSTRUCTION_LEASE)[^\]]*\]/g, '')
+    .trim();
+  if (!value || !/(?:[?？]\s*$|(?:请|需要|等待)(?:你|您)(?:决定|选择|确认)[。.!！]?\s*$)/u.test(value)) {
+    return false;
+  }
+  return !/(?:permission|authorize|approval|approve|delete|archive|withdraw|submit|purchase|paper identity|contribution type|new seed|venue change|权限|授权|批准|许可|删除|归档|投稿|撤稿|付费|更换\s*seed|贡献类型|论文身份|更换会议)/i.test(value.slice(-1200));
+}
+
+function acceptsExternalOperationalInput(session) {
+  return session.terminal?.state === 'WAITING_INPUT'
+    || (session.terminal?.state === 'WORKING' && session.terminal?.acceptsQueuedInput === true);
+}
+
+function acceptsManagedOperationalInput(session) {
+  if (session.bootstrapNeedsRetry) return false;
+  if (session.status === 'WAITING_INPUT') return true;
+  return session.status === 'RUNNING' && session.bootstrapStatus === 'SENT';
 }
 
 function deliveryKey(eventKey) {
@@ -93,6 +146,14 @@ function deliveryKey(eventKey) {
 
 function acknowledgedPrompt(prompt, messageKey) {
   return `[FIRM DELIVERY ${messageKey}]\n${prompt}`;
+}
+
+function goalBudgetSince(config, now, sessionEpoch = null) {
+  const rolling = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
+  const epoch = config.goalLoop?.budgetEpoch;
+  return [rolling, epoch, sessionEpoch]
+    .filter((value) => value && Number.isFinite(Date.parse(value)))
+    .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
 }
 
 export class AutomationEngine {
@@ -104,8 +165,11 @@ export class AutomationEngine {
     discoverExternalSessions = async () => ({ items: [] }),
     externalSessionInput = null,
     externalSessionSubmit = null,
+    externalSessionClear = null,
+    externalSessionDismissChoice = null,
     onExternalSessionStopped = null,
     schedulerMonitorProbe = probeSchedulerMonitor,
+    jobRegistry = null,
     now = () => new Date(),
   }) {
     this.config = config;
@@ -115,8 +179,11 @@ export class AutomationEngine {
     this.discoverExternalSessions = discoverExternalSessions;
     this.externalSessionInput = externalSessionInput;
     this.externalSessionSubmit = externalSessionSubmit;
+    this.externalSessionClear = externalSessionClear;
+    this.externalSessionDismissChoice = externalSessionDismissChoice;
     this.onExternalSessionStopped = onExternalSessionStopped;
     this.schedulerMonitorProbe = schedulerMonitorProbe;
+    this.jobRegistry = jobRegistry || new JobRegistry({ store, now });
     this.now = now;
     this.projectIds = new Set(config.projects.map((project) => project.id));
     this.queue = store.latestGpuQueueSnapshot()?.snapshot
@@ -129,6 +196,7 @@ export class AutomationEngine {
     this.externalStopCandidates = new Map();
     this.externalUnknownCandidates = new Map();
     this.externalProgressCandidates = new Map();
+    this.externalInteractionActions = new Map();
     this.externalSnapshot = null;
     this.externalCollectorAlertKey = null;
     this.schedulerMonitorAlertKey = null;
@@ -141,6 +209,10 @@ export class AutomationEngine {
 
   snapshot() {
     return this.queue;
+  }
+
+  jobsSnapshot() {
+    return this.jobRegistry.snapshot();
   }
 
   monitorSnapshot() {
@@ -164,9 +236,14 @@ export class AutomationEngine {
       this.queue = await this.queueCollector(this.config.gpuQueue);
       this.lastQueuePollAt = now;
       this.store.saveGpuQueueSnapshot(this.queue);
-      if (this.queue.status === 'ok') this.#ingestQueue(this.queue);
+      if (this.queue.status === 'ok') {
+        this.jobRegistry.syncGpuQueue(this.queue, (item) => eventProject(item, this.projectIds));
+        this.#ingestQueue(this.queue);
+      }
     }
+    await this.#ensurePersistentControls();
     await this.#watchSchedulerMonitor();
+    this.#ingestJobs(this.jobsSnapshot());
     await this.#watchSessions();
     await this.#watchExternalStops();
     await this.#deliverPending();
@@ -180,6 +257,46 @@ export class AutomationEngine {
   async #externalSessions() {
     this.externalSnapshot ||= await this.discoverExternalSessions();
     return this.externalSnapshot;
+  }
+
+  async #ensurePersistentControls() {
+    if (!this.config.gpuQueue?.schedulerAutoStart) return;
+    const targets = this.config.controlTargets || [];
+    if (!targets.some((target) => target.id === 'GPU_SCHEDULER')) return;
+    const sessions = await this.sessionManager.list();
+    if (sessions.some((session) => (
+      session.projectId === 'GPU_SCHEDULER' && ACTIVE_SESSION_STATES.has(session.status)
+    ))) return;
+    const external = await this.#externalSessions();
+    if (external.items?.some((session) => (
+      session.controlId === 'GPU_SCHEDULER' && session.terminal
+    ))) return;
+    try {
+      const started = await this.sessionManager.start('GPU_SCHEDULER', {
+        cols: 120,
+        rows: 32,
+        bootstrap: true,
+      });
+      this.store.createAutomationEvent({
+        eventKey: `control:GPU_SCHEDULER:persistent:${started.id}`,
+        category: 'session_watchdog', eventType: 'CONTROL_SESSION_RESTORED',
+        targetId: 'GPU_SCHEDULER', severity: 'info', status: 'RESOLVED',
+        title: 'GPU Scheduler control session restored',
+        message: 'The persistent GPU Scheduler session was missing and has been restarted.',
+        source: { deliveryPolicy: 'none', sessionId: started.id },
+        note: 'persistent_control_invariant_restored',
+      });
+    } catch (error) {
+      this.store.createAutomationEvent({
+        eventKey: `control:GPU_SCHEDULER:restore_failed:${this.now().toISOString()}`,
+        category: 'session_watchdog', eventType: 'CONTROL_SESSION_RESTORE_FAILED',
+        targetId: 'GPU_SCHEDULER', severity: 'error',
+        title: 'GPU Scheduler control session could not be restored',
+        message: 'FIRM failed to restore the required persistent GPU Scheduler session.',
+        source: { deliveryPolicy: 'manual' },
+        note: String(error.message || error).slice(0, 500),
+      });
+    }
   }
 
   async #watchSchedulerMonitor() {
@@ -217,6 +334,7 @@ export class AutomationEngine {
   async #watchExternalStops() {
     const external = await this.#externalSessions();
     await this.#reconcileExternalOutbox(external.items || []);
+    const handledInteractions = await this.#reconcileForegroundInteractions(external.items || []);
     const collectorProblems = [
       external.status && external.status !== 'ok'
         ? `process:${external.status}:${external.reason || 'unknown'}` : null,
@@ -241,12 +359,47 @@ export class AutomationEngine {
       this.#resolveEvent(this.externalCollectorAlertKey, 'session_collector_recovered');
       this.externalCollectorAlertKey = null;
     }
+    if (!collectorProblems.length) {
+      for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
+        candidate.eventType === 'SESSION_COLLECTOR_DEGRADED'
+      ))) {
+        this.store.setAutomationEvent(event.id, {
+          status: 'RESOLVED', note: 'collector_health_verified_after_restart',
+        });
+      }
+    }
     const seen = new Set();
     for (const session of external.items || []) {
       if (!session.projectId || !this.projectIds.has(session.projectId)) continue;
       const key = `${session.projectId}:${session.pid}`;
       seen.add(key);
       const current = session.terminal?.state || 'UNKNOWN';
+      const currentProgressAt = Date.parse(session.heartbeat?.lastProgressAt || '');
+      const currentAssistantAt = Date.parse(session.heartbeat?.latestAssistantAt || '');
+      for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
+        candidate.targetId === session.projectId
+        && ['SESSION_PROGRESS_STALLED', 'SESSION_ACCEPTED_INPUT_STALLED'].includes(candidate.eventType)
+      ))) {
+        if (event.eventType === 'SESSION_PROGRESS_STALLED') {
+          const stalledAt = Date.parse(event.source?.lastProgressAt || '');
+          if (Number.isFinite(currentProgressAt) && Number.isFinite(stalledAt)
+              && currentProgressAt > stalledAt) {
+            this.store.setAutomationEvent(event.id, {
+              status: 'RESOLVED', note: 'durable_progress_evidence_advanced',
+            });
+          }
+          continue;
+        }
+        const message = event.source?.messageKey
+          ? this.store.getOutboxMessage(event.source.messageKey) : null;
+        const sentAt = Date.parse(message?.sentAt || message?.sendingAt || '');
+        if (Number.isFinite(currentAssistantAt) && Number.isFinite(sentAt)
+            && currentAssistantAt > sentAt) {
+          this.store.setAutomationEvent(event.id, {
+            status: 'RESOLVED', note: 'durable_assistant_progress_after_delivery',
+          });
+        }
+      }
       if (session.heartbeat?.episodeId) {
         this.store.observeSessionEpisode({
           episodeId: session.heartbeat.episodeId,
@@ -264,6 +417,11 @@ export class AutomationEngine {
       }
       const previous = this.externalTerminalStates.get(key);
       this.externalTerminalStates.set(key, current);
+      if (handledInteractions.has(key)) {
+        this.externalStopCandidates.delete(key);
+        this.externalWaitingSince.delete(key);
+        continue;
+      }
       const tailHash = session.terminal?.tailHash || 'unknown';
       const priorUnknown = this.externalUnknownCandidates.get(key);
       if (current === 'UNKNOWN') {
@@ -378,19 +536,19 @@ export class AutomationEngine {
         }
         this.externalProgressCandidates.delete(key);
       }
-      const gpuWait = gpuWaitStatus(session, this.queue);
-      if (current === 'WAITING_INPUT' && gpuWait.waiting) {
+      const jobWait = jobWaitStatus(session, this.jobsSnapshot());
+      if (current === 'WAITING_INPUT' && jobWait.waiting) {
         this.externalStopCandidates.delete(key);
         this.externalWaitingSince.delete(key);
         this.store.createAutomationEvent({
-          eventKey: `gpu-wait:${session.projectId}:${gpuWait.matchedRunIds.sort().join(',')}`,
-          category: 'session_watchdog', eventType: 'GPU_WAIT_ACCEPTED',
+          eventKey: `job-wait:${session.projectId}:${jobWait.matchedRunIds.sort().join(',')}`,
+          category: 'session_watchdog', eventType: 'JOB_WAIT_ACCEPTED',
           targetId: session.projectId, severity: 'info', status: 'RESOLVED',
-          title: `Legitimate GPU wait: ${session.projectId}`,
-          message: `The project explicitly declared a wait on active GPU run(s): ${gpuWait.matchedRunIds.join(', ')}.`,
+          title: `Legitimate registered-job wait: ${session.projectId}`,
+          message: `The project explicitly declared a wait on active registered job(s): ${jobWait.matchedRunIds.join(', ')}.`,
           source: {
             deliveryPolicy: 'none', pid: session.pid,
-            runIds: gpuWait.matchedRunIds,
+            runIds: jobWait.matchedRunIds,
           },
           note: 'goal_and_stop_review_suppressed_until_gpu_terminal_state',
         });
@@ -459,6 +617,209 @@ export class AutomationEngine {
     }
   }
 
+  async #reconcileForegroundInteractions(sessions) {
+    const handled = new Set();
+    for (const session of sessions) {
+      if (!session.projectId || !this.projectIds.has(session.projectId)) continue;
+      const key = `${session.projectId}:${session.pid}`;
+      const terminal = session.terminal || {};
+      const prior = this.externalInteractionActions.get(key);
+      const priorStillVisible = prior?.kind === 'acked_draft'
+        ? terminal.state === 'DRAFT_PENDING_ENTER'
+          && terminal.draftDeliveryMarker === prior.marker
+        : prior?.kind === 'routine_choice'
+          ? terminal.state === 'ROUTINE_CHOICE'
+          : prior?.kind === 'routine_question'
+            ? terminal.state === 'WAITING_INPUT'
+              && session.heartbeat?.latestAssistantAt === prior.latestAssistantAt
+          : false;
+      if (prior && !priorStillVisible) {
+        const event = this.store.getAutomationEvent(prior.eventKey);
+        if (event && ['PENDING', 'HELD', 'SENT'].includes(event.status)) {
+          this.store.setAutomationEvent(event.id, {
+            status: 'RESOLVED', note: 'foreground_interaction_advanced',
+          });
+        }
+        this.externalInteractionActions.delete(key);
+      }
+
+      if (terminal.state === 'DRAFT_PENDING_ENTER') {
+        handled.add(key);
+        const marker = terminal.draftDeliveryMarker || null;
+        const message = marker ? this.store.getOutboxMessage(marker) : null;
+        if (!marker || !message || message.status !== 'ACKED') continue;
+        const eventKey = `interaction:${session.projectId}:${session.pid}:acked-draft:${marker}`;
+        if (terminal.modelWorking) continue;
+        if (prior?.eventKey === eventKey) {
+          const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
+          if (this.now().getTime() - prior.lastAttemptAt < retryDelayMs) continue;
+          if (prior.attempts >= 3) {
+            this.store.createAutomationEvent({
+              eventKey: `${eventKey}:clear-exhausted`, category: 'session_control',
+              eventType: 'ACKED_DELIVERY_DRAFT_CLEAR_EXHAUSTED',
+              targetId: session.projectId, severity: 'error',
+              title: `Duplicate draft could not be cleared: ${session.projectId}`,
+              message: 'The same acknowledged marker remained in the editor after three whole-input clear attempts.',
+              source: { deliveryPolicy: 'manual', pid: session.pid, messageKey: marker },
+            });
+            continue;
+          }
+        }
+        if (typeof this.externalSessionClear !== 'function') {
+          this.store.createAutomationEvent({
+            eventKey, category: 'session_control', eventType: 'ACKED_DELIVERY_DRAFT_VISIBLE',
+            targetId: session.projectId, severity: 'error',
+            title: `Acknowledged delivery remains in the prompt: ${session.projectId}`,
+            message: 'The delivery is already present in Claude history, so it must be cleared rather than submitted again.',
+            source: { deliveryPolicy: 'manual', pid: session.pid, messageKey: marker },
+          });
+          continue;
+        }
+        try {
+          await this.externalSessionClear(session);
+          this.store.createAutomationEvent({
+            eventKey, category: 'session_control', eventType: 'ACKED_DELIVERY_DRAFT_CLEARED',
+            targetId: session.projectId, severity: 'warn', status: 'SENT',
+            title: `Cleared duplicate acknowledged draft: ${session.projectId}`,
+            message: 'A FIRM delivery already acknowledged in Claude history was still visible in the editor and was cleared without resubmission.',
+            source: { deliveryPolicy: 'none', pid: session.pid, messageKey: marker },
+          });
+          this.externalInteractionActions.set(key, {
+            eventKey, kind: 'acked_draft', marker,
+            attempts: (prior?.attempts || 0) + 1,
+            lastAttemptAt: this.now().getTime(),
+          });
+        } catch (error) {
+          this.store.createAutomationEvent({
+            eventKey, category: 'session_control', eventType: 'ACKED_DELIVERY_DRAFT_CLEAR_FAILED',
+            targetId: session.projectId, severity: 'error',
+            title: `Could not clear duplicate draft: ${session.projectId}`,
+            message: 'The acknowledged draft remains visible; no duplicate submission was attempted.',
+            source: { deliveryPolicy: 'manual', pid: session.pid, messageKey: marker },
+            note: String(error.message || error).slice(0, 500),
+          });
+        }
+        continue;
+      }
+
+      if (terminal.state === 'WAITING_INPUT'
+          && routineQuestion(session.heartbeat?.latestAssistantText)) {
+        handled.add(key);
+        const latestAssistantAt = session.heartbeat?.latestAssistantAt || 'unknown';
+        const questionIdentity = createHash('sha256').update(JSON.stringify({
+          latestAssistantAt,
+          text: session.heartbeat?.latestAssistantText,
+        })).digest('hex').slice(0, 24);
+        const eventKey = `interaction:${session.projectId}:${session.pid}:question:${questionIdentity}`;
+        if (prior?.eventKey === eventKey) continue;
+        const event = this.store.createAutomationEvent({
+          eventKey, category: 'session_control', eventType: 'ROUTINE_QUESTION_RETURNED_TO_CLAUDE',
+          targetId: session.projectId, severity: 'info',
+          title: `Returned routine question to Claude: ${session.projectId}`,
+          message: 'Claude asked an ordinary research or engineering question, so FIRM returned it for self-resolution without supplying a new goal or scientific direction.',
+          source: { deliveryPolicy: 'none', pid: session.pid },
+        });
+        const delivery = await this.#sendExternalAcknowledged({
+          event, session, prompt: selfResolveQuestionPrompt(),
+          note: 'routine_question_returned_to_claude',
+        });
+        if (delivery.status !== 'failed') {
+          this.externalInteractionActions.set(key, {
+            eventKey, kind: 'routine_question', latestAssistantAt,
+            attempts: 1, lastAttemptAt: this.now().getTime(),
+          });
+        }
+        continue;
+      }
+
+      if (terminal.state !== 'ROUTINE_CHOICE') continue;
+      handled.add(key);
+      const choiceIdentity = createHash('sha256').update(JSON.stringify({
+        selectedOptionNumber: terminal.selectedOptionNumber,
+        selectedOptionText: terminal.selectedOptionText,
+        recommendedSelected: terminal.recommendedSelected,
+      })).digest('hex').slice(0, 24);
+      const eventKey = `interaction:${session.projectId}:${session.pid}:choice:${choiceIdentity}`;
+      if (prior?.eventKey === eventKey) {
+        const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
+        if (this.now().getTime() - prior.lastAttemptAt < retryDelayMs) continue;
+        if (prior.attempts >= 3) {
+          this.store.createAutomationEvent({
+            eventKey: `${eventKey}:selection-exhausted`, category: 'session_control',
+            eventType: 'ROUTINE_RECOMMENDATION_ACCEPT_EXHAUSTED',
+            targetId: session.projectId, severity: 'error',
+            title: `Routine choice did not advance: ${session.projectId}`,
+            message: 'The same Claude recommendation remained selected after three Enter attempts.',
+            source: { deliveryPolicy: 'manual', pid: session.pid },
+          });
+          continue;
+        }
+      }
+      if (terminal.recommendedSelected) {
+        if (typeof this.externalSessionSubmit !== 'function') continue;
+        try {
+          await this.externalSessionSubmit(session);
+          this.store.createAutomationEvent({
+            eventKey, category: 'session_control', eventType: 'ROUTINE_RECOMMENDATION_ACCEPTED',
+            targetId: session.projectId, severity: 'info', status: 'SENT',
+            title: `Accepted Claude's routine recommendation: ${session.projectId}`,
+            message: `Claude marked option ${terminal.selectedOptionNumber} as Recommended; FIRM confirmed that option and will verify interaction progress.`,
+            source: {
+              deliveryPolicy: 'none', pid: session.pid,
+              selectedOptionNumber: terminal.selectedOptionNumber,
+              selectedOptionText: terminal.selectedOptionText,
+            },
+          });
+          this.externalInteractionActions.set(key, {
+            eventKey, kind: 'routine_choice',
+            attempts: (prior?.attempts || 0) + 1,
+            lastAttemptAt: this.now().getTime(),
+          });
+        } catch (error) {
+          this.store.createAutomationEvent({
+            eventKey, category: 'session_control', eventType: 'ROUTINE_RECOMMENDATION_ACCEPT_FAILED',
+            targetId: session.projectId, severity: 'error',
+            title: `Could not confirm routine recommendation: ${session.projectId}`,
+            message: 'Claude remains at its routine choice menu.',
+            source: { deliveryPolicy: 'manual', pid: session.pid },
+            note: String(error.message || error).slice(0, 500),
+          });
+        }
+        continue;
+      }
+
+      if (!this.externalSessionDismissChoice || !this.externalSessionInput) continue;
+      try {
+        await this.externalSessionDismissChoice(session);
+        const event = this.store.createAutomationEvent({
+          eventKey, category: 'session_control', eventType: 'ROUTINE_CHOICE_RETURNED_TO_CLAUDE',
+          targetId: session.projectId, severity: 'info',
+          title: `Returned routine choice to Claude: ${session.projectId}`,
+          message: 'The menu had no recommended selection, so FIRM dismissed it and instructed Claude to decide from existing evidence.',
+          source: { deliveryPolicy: 'none', pid: session.pid },
+        });
+        await this.#sendExternalAcknowledged({
+          event, session, prompt: selfResolveChoicePrompt(),
+          note: 'routine_choice_returned_to_claude',
+        });
+        this.externalInteractionActions.set(key, {
+          eventKey, kind: 'routine_choice', attempts: 1,
+          lastAttemptAt: this.now().getTime(),
+        });
+      } catch (error) {
+        this.store.createAutomationEvent({
+          eventKey, category: 'session_control', eventType: 'ROUTINE_CHOICE_SELF_RESOLUTION_FAILED',
+          targetId: session.projectId, severity: 'error',
+          title: `Could not return routine choice to Claude: ${session.projectId}`,
+          message: 'The ordinary choice remains unresolved.',
+          source: { deliveryPolicy: 'manual', pid: session.pid },
+          note: String(error.message || error).slice(0, 500),
+        });
+      }
+    }
+    return handled;
+  }
+
   async #reconcileExternalOutbox(sessions) {
     const unacknowledged = this.store.listUnacknowledgedOutbox(5000);
     for (const message of unacknowledged) {
@@ -514,9 +875,16 @@ export class AutomationEngine {
       }
 
       const marker = session.terminal?.draftDeliveryMarker || null;
+      const collapsedPasteMatches = !marker
+        && session.terminal?.collapsedPasteDraft === true
+        && unacknowledged.filter((candidate) => (
+          candidate.sessionPid === message.sessionPid
+          && candidate.targetId === message.targetId
+          && ['SENT_AWAITING_ACK', 'UNCERTAIN'].includes(candidate.status)
+        )).length === 1;
       const lastEnterAt = Date.parse(message.lastEnterAt || message.sentAt || message.sendingAt || '');
       const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
-      if (marker !== message.messageKey
+      if ((marker !== message.messageKey && !collapsedPasteMatches)
           || !['SENT_AWAITING_ACK', 'UNCERTAIN'].includes(message.status)
           || typeof this.externalSessionSubmit !== 'function'
           || (Number.isFinite(lastEnterAt) && this.now().getTime() - lastEnterAt < retryDelayMs)) {
@@ -549,6 +917,7 @@ export class AutomationEngine {
     const messageKey = deliveryKey(event.eventKey);
     const existing = this.store.listUnacknowledgedOutbox(5000).find((message) => (
       message.targetId === event.targetId && message.sessionPid === session.pid
+      && ['QUEUED', 'SENDING', 'SENT_AWAITING_ACK'].includes(message.status)
     ));
     if (existing && existing.messageKey !== messageKey) {
       this.#holdEvent(event, `blocked_by_pending_delivery:${existing.messageKey}`);
@@ -612,9 +981,21 @@ export class AutomationEngine {
             : 'The request must not launch until submission readiness is repaired.',
           source: { deliveryPolicy: 'auto_notify', queueItem: item },
         });
+        const projectId = eventProject(item, this.projectIds);
+      if (projectId && readiness.state === 'NOT_READY') {
+          this.store.createAutomationEvent({
+            eventKey: `gpu:${item.runId}:preparation_required`,
+            category: 'gpu_queue', eventType: 'GPU_PREPARATION_REQUIRED',
+            targetId: projectId, runId: item.runId, severity: 'error',
+            title: `GPU preparation required: ${item.runId}`,
+            message: 'The request has a concrete preparation defect that the project must repair.',
+            source: { deliveryPolicy: 'auto_notify', queueItem: item },
+          });
+        }
       }
       if (item.state === 'running') {
         this.#resolveEvent(`gpu:${item.runId}:submitted`, 'scheduler_accepted_request');
+        this.#resolveEvent(`gpu:${item.runId}:preparation_required`, 'scheduler_accepted_repaired_request');
         const efficiency = item.efficiency || {};
         const alertStates = new Set([
           'BLOCKED', 'STALLED', 'INEFFICIENT', 'RESOURCE_MISMATCH', 'IMBALANCED',
@@ -635,34 +1016,48 @@ export class AutomationEngine {
       }
       if (TERMINAL_QUEUE_STATES.has(item.state)) {
         this.#resolveEvent(`gpu:${item.runId}:submitted`, `queue_reached_${item.state}`);
+        this.#resolveEvent(`gpu:${item.runId}:preparation_required`, `queue_reached_${item.state}`);
         for (const state of ['BLOCKED', 'STALLED', 'INEFFICIENT', 'RESOURCE_MISMATCH', 'IMBALANCED']) {
           this.#resolveEvent(`gpu:${item.runId}:efficiency:${state}`, `queue_reached_${item.state}`);
         }
-        const projectId = eventProject(item, this.projectIds);
-        this.store.createAutomationEvent({
-          eventKey: `gpu:${item.runId}:${item.state}`,
-          category: 'gpu_queue',
-          eventType: 'GPU_RESULT_READY',
-          targetId: projectId,
-          runId: item.runId,
-          severity: eventSeverity(item.state),
-          title: `GPU run ${item.state}: ${item.runId}`,
-          message: projectId
-            ? `The authoritative result is ready for ${projectId}.`
-            : 'The result is ready, but its project could not be mapped automatically.',
-          source: {
-            deliveryPolicy: projectId ? 'auto_notify' : 'manual',
-            queueItem: item,
-          },
-          note: projectId ? null : 'unmapped_project',
-        });
+        // GPU Queue is an executor only. Result delivery is owned by Job Registry.
+        this.#resolveEvent(`gpu:${item.runId}:${item.state}`, 'legacy_gpu_result_path_removed');
       }
+    }
+  }
+
+  #ingestJobs(snapshot) {
+    for (const job of snapshot.items || []) {
+      if (job.state === 'cancelled'
+          || job.metadata?.notify === false || job.metadata?.lifecycleObserved !== true
+          || !TERMINAL_QUEUE_STATES.has(job.state)) {
+        if (TERMINAL_QUEUE_STATES.has(job.state)) {
+          this.#resolveEvent(`job:${job.runId}:${job.state}:result`, 'historical_terminal_import_not_notifiable');
+        }
+        continue;
+      }
+      this.store.createAutomationEvent({
+        eventKey: `job:${job.runId}:${job.state}:result`,
+        category: 'job_registry', eventType: 'JOB_RESULT_READY',
+        targetId: job.projectId, runId: job.runId,
+        severity: eventSeverity(job.state),
+        title: `Registered job ${job.state}: ${job.runId}`,
+        message: `The authoritative ${job.kind} job result is ready for ${job.projectId}.`,
+        source: { deliveryPolicy: 'auto_notify', job },
+      });
     }
   }
 
   #resolveEvent(eventKey, note) {
     const event = this.store.getAutomationEvent(eventKey);
-    if (!event || !['PENDING', 'HELD'].includes(event.status)) return;
+    if (!event || !['PENDING', 'HELD', 'SENT'].includes(event.status)) return;
+    for (const message of this.store.listUnacknowledgedOutbox(5000).filter((candidate) => (
+      candidate.automationEventId === event.id
+    ))) {
+      this.store.failOutboxMessage(message.id, {
+        status: 'SUPERSEDED', error: `event_resolved:${note}`,
+      });
+    }
     this.store.setAutomationEvent(event.id, { status: 'RESOLVED', note });
   }
 
@@ -672,29 +1067,42 @@ export class AutomationEngine {
   }
 
   #externalDispatchBlocked(targetId, session) {
+    const dispatch = this.externalDispatches.get(targetId);
+    const resetAt = Date.parse(session.terminal?.lastRateLimitResetAt || '');
+    if (dispatch && Number.isFinite(resetAt) && resetAt > dispatch.deliveredAt) {
+      this.externalDispatches.delete(targetId);
+      for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
+        candidate.targetId === targetId
+        && candidate.eventType === 'SESSION_ACCEPTED_INPUT_STALLED'
+      ))) {
+        this.store.setAutomationEvent(event.id, {
+          status: 'RESOLVED', note: 'provider_limit_reset_started_new_delivery_epoch',
+        });
+      }
+    }
     const durableDispatch = this.store.listUnacknowledgedOutbox(5000).find((message) => (
       message.targetId === targetId && message.sessionPid === session.pid
-      && ['QUEUED', 'SENDING', 'SENT_AWAITING_ACK', 'UNCERTAIN'].includes(message.status)
+      && ['QUEUED', 'SENDING', 'SENT_AWAITING_ACK'].includes(message.status)
     ));
     if (durableDispatch) return true;
-    const dispatch = this.externalDispatches.get(targetId);
-    if (!dispatch) return false;
-    if (dispatch.pid !== session.pid) {
+    const activeDispatch = this.externalDispatches.get(targetId);
+    if (!activeDispatch) return false;
+    if (activeDispatch.pid !== session.pid) {
       this.externalDispatches.delete(targetId);
       return false;
     }
-    const elapsed = this.now().getTime() - dispatch.deliveredAt;
+    const elapsed = this.now().getTime() - activeDispatch.deliveredAt;
     if (session.terminal?.state === 'WORKING') {
-      dispatch.seenWorking = true;
+      activeDispatch.seenWorking = true;
       return true;
     }
     if (session.terminal?.state !== 'WAITING_INPUT') return true;
     const assistantAt = Date.parse(session.heartbeat?.latestAssistantAt || '');
-    const assistantAdvanced = Number.isFinite(assistantAt) && assistantAt > dispatch.deliveredAt;
+    const assistantAdvanced = Number.isFinite(assistantAt) && assistantAt > activeDispatch.deliveredAt;
     const completedFastCycle = assistantAdvanced
-      && session.terminal.tailHash !== dispatch.tailHash
+      && session.terminal.tailHash !== activeDispatch.tailHash
       && elapsed >= this.config.goalLoop.graceMs;
-    if (dispatch.seenWorking || completedFastCycle) {
+    if (activeDispatch.seenWorking || completedFastCycle) {
       this.externalDispatches.delete(targetId);
       for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
         candidate.targetId === targetId
@@ -713,24 +1121,17 @@ export class AutomationEngine {
         && candidate.eventType === 'SESSION_ACCEPTED_INPUT_STALLED'
         && candidate.status !== 'RESOLVED'
       ));
-      const terminalFailure = priorStalls.length >= 1;
       this.store.createAutomationEvent({
-        eventKey: `delivery:${dispatch.messageKey || targetId}:accepted_input_stalled`,
+        eventKey: `delivery:${activeDispatch.messageKey || targetId}:accepted_input_stalled`,
         category: 'session_watchdog', eventType: 'SESSION_ACCEPTED_INPUT_STALLED',
-        targetId, severity: terminalFailure ? 'error' : 'warn',
+        targetId, severity: 'warn',
         title: `Accepted input produced no assistant event: ${targetId}`,
-        message: terminalFailure
-          ? 'A second accepted continuation produced no assistant event; automatic retries are held.'
-          : 'The accepted continuation produced no assistant event; one bounded recovery is permitted.',
+        message: 'The accepted continuation produced no assistant event; automatic retries remain held until assistant progress is observed.',
         source: {
           deliveryPolicy: 'manual', pid: session.pid,
-          messageKey: dispatch.messageKey || null, elapsedMs: elapsed,
+          messageKey: activeDispatch.messageKey || null, elapsedMs: elapsed,
         },
       });
-      if (!terminalFailure) {
-        this.externalDispatches.delete(targetId);
-        return false;
-      }
     }
     return true;
   }
@@ -832,8 +1233,7 @@ export class AutomationEngine {
       if (deliveredTargets.has(event.targetId)) continue;
       let candidates = sessions.filter((session) => (
         session.projectId === event.targetId
-        && session.status === 'WAITING_INPUT'
-        && !session.bootstrapNeedsRetry
+        && acceptsManagedOperationalInput(session)
       ));
       if (candidates.length === 1) {
         try {
@@ -867,7 +1267,7 @@ export class AutomationEngine {
         (event.targetId === 'GPU_SCHEDULER'
           ? session.controlId === event.targetId
           : session.projectId === event.targetId)
-        && session.terminal?.state === 'WAITING_INPUT'
+        && acceptsExternalOperationalInput(session)
       ));
       if (externalCandidates.length === 1 && this.externalSessionInput) {
         if (this.#externalDispatchBlocked(event.targetId, externalCandidates[0])) continue;
@@ -945,6 +1345,7 @@ export class AutomationEngine {
   }
 
   async #runGoalLoop() {
+    if (this.config.goalLoop?.enabled !== true) return;
     const policies = this.store.listAutomationPolicies().filter((policy) => policy.enabled);
     if (!policies.length) return;
     let sessions = await this.sessionManager.list();
@@ -959,7 +1360,11 @@ export class AutomationEngine {
         const externalSession = external.items?.find((session) => session.projectId === policy.targetId);
         if (externalSession) {
           const waitingKey = `${policy.targetId}:${externalSession.pid}`;
-          if (gpuWaitStatus(externalSession, this.queue).waiting) {
+          if (jobWaitStatus(externalSession, this.jobsSnapshot()).waiting) {
+            this.externalWaitingSince.delete(waitingKey);
+            continue;
+          }
+          if (Number(externalSession.heartbeat?.activeToolProcessCount || 0) > 0) {
             this.externalWaitingSince.delete(waitingKey);
             continue;
           }
@@ -1010,14 +1415,28 @@ export class AutomationEngine {
           ));
           const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
             item.targetId === policy.targetId && item.category !== 'goal_loop'
-            && (item.severity === 'error' || item.eventType === 'GPU_RESULT_READY')
+            && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
           ));
           if (pendingIntervention || blockingEvent) continue;
-          const since = new Date(this.now().getTime() - 24 * 60 * 60 * 1000).toISOString();
+          const since = goalBudgetSince(
+            this.config,
+            this.now(),
+            externalSession.terminal?.lastRateLimitResetAt,
+          );
           const recent = this.store.recentGoalActions(policy.targetId, since);
           if (recent.count >= this.config.goalLoop.maxContinuesPerDay) continue;
-          // A durable outbox lock plus post-delivery assistant evidence proves turn
-          // completion. External sessions therefore do not need a wall-clock cooldown.
+          // Delivery acknowledgement prevents duplicate input, while the cooldown
+          // prevents blind retries. A new assistant turn is a new input point and
+          // may contain routine options that Claude must resolve autonomously.
+          const latestAssistantAt = Date.parse(externalSession.heartbeat?.latestAssistantAt || '');
+          const assistantAdvanced = recent.lastDeliveredAt
+            && Number.isFinite(latestAssistantAt)
+            && latestAssistantAt > Date.parse(recent.lastDeliveredAt);
+          if (recent.lastDeliveredAt && !assistantAdvanced
+              && this.now().getTime() - Date.parse(recent.lastDeliveredAt)
+                < this.config.goalLoop.cooldownMs) {
+            continue;
+          }
           const event = this.store.createAutomationEvent({
             eventKey: `goal:external:${externalSession.pid}:${externalSession.terminal.tailHash}:continue`,
             category: 'goal_loop', eventType: 'GOAL_CONTINUED',
@@ -1078,7 +1497,8 @@ export class AutomationEngine {
         session.projectId === policy.targetId
         && (managed.pid == null || session.pid === managed.pid)
       ));
-      if (gpuWaitStatus(managedHistory, this.queue).waiting) continue;
+      if (jobWaitStatus(managedHistory, this.jobsSnapshot()).waiting) continue;
+      if (Number(managedHistory?.heartbeat?.activeToolProcessCount || 0) > 0) continue;
       if (managed.status !== 'WAITING_INPUT' || managed.bootstrapStatus !== 'SENT') continue;
       const waitingSince = managed.waitingSince ? Date.parse(managed.waitingSince) : NaN;
       if (!Number.isFinite(waitingSince)
@@ -1102,7 +1522,7 @@ export class AutomationEngine {
       const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
         item.targetId === policy.targetId
         && item.category !== 'goal_loop'
-        && (item.severity === 'error' || item.eventType === 'GPU_RESULT_READY')
+        && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
       ));
       if (pendingIntervention || blockingEvent) {
         this.store.createAutomationEvent({
@@ -1121,7 +1541,7 @@ export class AutomationEngine {
         });
         continue;
       }
-      const since = new Date(this.now().getTime() - 24 * 60 * 60 * 1000).toISOString();
+      const since = goalBudgetSince(this.config, this.now());
       const recent = this.store.recentGoalActions(policy.targetId, since);
       if (recent.count >= this.config.goalLoop.maxContinuesPerDay) {
         this.store.createAutomationEvent({
@@ -1181,7 +1601,7 @@ export class AutomationEngine {
     const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
       item.targetId === stop.projectId
       && item.category !== 'goal_loop'
-      && (item.severity === 'error' || item.eventType === 'GPU_RESULT_READY')
+      && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
     ));
     if (pendingIntervention || blockingEvent) {
       return {
@@ -1190,7 +1610,7 @@ export class AutomationEngine {
       };
     }
 
-    const since = new Date(this.now().getTime() - 24 * 60 * 60 * 1000).toISOString();
+    const since = goalBudgetSince(this.config, this.now());
     const recent = this.store.recentGoalActions(stop.projectId, since);
     if (recent.count >= this.config.goalLoop.maxContinuesPerDay) {
       this.store.createAutomationEvent({
@@ -1211,9 +1631,9 @@ export class AutomationEngine {
     ));
     if (candidates.length !== 1) return { status: 'session_changed' };
     const session = candidates[0];
-    const gpuWait = gpuWaitStatus(session, this.queue);
-    if (gpuWait.waiting) {
-      return { status: 'waiting_for_gpu', runIds: gpuWait.matchedRunIds };
+    const jobWait = jobWaitStatus(session, this.jobsSnapshot());
+    if (jobWait.waiting) {
+      return { status: 'waiting_for_job', runIds: jobWait.matchedRunIds };
     }
     if (session.terminal?.state !== 'WAITING_INPUT') {
       return { status: 'session_already_running', terminalState: session.terminal?.state || 'UNKNOWN' };
@@ -1264,6 +1684,7 @@ export class AutomationEngine {
     }
     const pending = this.store.listUnacknowledgedOutbox(5000).find((message) => (
       message.targetId === session.projectId && message.sessionPid === session.pid
+      && ['QUEUED', 'SENDING', 'SENT_AWAITING_ACK'].includes(message.status)
     ));
     if (pending) {
       return { status: 'blocked_by_pending_delivery', messageKey: pending.messageKey };
@@ -1326,5 +1747,7 @@ export class AutomationEngine {
 }
 
 export const automationInternals = Object.freeze({
-  eventProject, queuePrompt, automationPrompt, goalPrompt, deliveryKey, acknowledgedPrompt,
+  eventProject, queuePrompt, automationPrompt, goalPrompt, selfResolveChoicePrompt,
+  acceptsExternalOperationalInput, acceptsManagedOperationalInput,
+  deliveryKey, acknowledgedPrompt,
 });

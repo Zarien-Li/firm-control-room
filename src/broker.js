@@ -33,7 +33,7 @@ async function main() {
   const broker = await startBroker();
   console.log(`FIRM session broker PID ${process.pid} listening at ${broker.config.brokerSocketPath}`);
   const shutdown = async () => {
-    await broker.close();
+    await broker.close({ terminate: true });
     process.exit(0);
   };
   process.once('SIGTERM', shutdown);

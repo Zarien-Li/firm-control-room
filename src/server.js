@@ -6,11 +6,16 @@ import { WebSocketServer } from 'ws';
 import { auditSnapshot } from './audit.js';
 import { AutomationEngine } from './automation-engine.js';
 import { BrokerClient } from './broker-client.js';
-import { readRecentClaudeActivity } from './claude-history.js';
+import { readClaudeHistoryHeartbeat, readRecentClaudeActivity } from './claude-history.js';
 import { collectClaudeSessions, collectSnapshot } from './collectors.js';
 import { loadConfig } from './config.js';
 import { createEvidenceBundle, verifyEvidenceBundle } from './evidence.js';
-import { sendItermMessage, submitItermDraft } from './iterm-status.js';
+import {
+  clearItermDraft,
+  dismissItermChoice,
+  sendItermMessage,
+  submitItermDraft,
+} from './iterm-status.js';
 import { SessionError } from './session-manager.js';
 import { deriveOperationalState } from './session-state.js';
 import {
@@ -21,6 +26,7 @@ import {
   semanticPacketHash,
 } from './semantic-audit.js';
 import { createStore } from './store.js';
+import { JobRegistry } from './job-registry.js';
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -88,7 +94,9 @@ function externalContinuationPrompt() {
     '[FIRM USER-APPROVED CONTINUATION]',
     '继续自主推进当前已锁定研究目标。以当前可信证据和最新 active research skills 为依据，在同一 turn 内连续完成一组相互连贯的高价值动作；每完成一个常规动作后重新判断并继续下一个独立动作。',
     'GPU 尚未 compute-ready 时，继续完成所有可并行的 CPU、代码、数据、解释和 baseline 工作。',
-    '只有在所有独立的非 GPU 工作都完成、且唯一阻塞是当前项目仍处于 pending/running 的 GPU 请求时，才以精确机器标记 [FIRM WAITING_FOR_GPU run_id=<active_run_id>] 结束；不得为已失败、已完成、缺失或仅计划中的请求输出该标记。',
+    '所有未来 GPU 作业必须先准备 compute-ready 的远端 command 文件，再调用 FIRM 仓库中的 scripts/submit-gpu-request.sh；不得自行选择 CUDA_VISIBLE_DEVICES 或通过 SSH/Docker 直接启动新 GPU worker。后续等待标记必须使用提交工具返回的规范 RUN_ID。',
+    '所有本地 CPU、远端 CPU、SSH 和其他长任务必须通过 scripts/run-registered-job.sh 启动，或通过 /api/jobs 显式注册和更新；不得让 FIRM 猜测进程状态。',
+    '只有在所有独立工作都完成、且唯一阻塞是 Registry 中仍为 pending/running 的任务时，才以精确机器标记 [FIRM WAITING_FOR_JOB run_id=<active_run_id>] 结束；GPU 旧标记仍兼容，但不得为已失败、已完成、缺失或仅计划中的请求输出等待标记。',
     '不要因为完成一次实验、状态记录、请求包、代码修复或证据读取就结束本 turn；不要扩大 sealed arena，不把候选失败改写成 analysis-paper identity，不要返回常规菜单。',
     '仅在真实权限、不可逆操作、异常资源请求或必须由 PI 决定的科学歧义时暂停。',
   ].join('\n');
@@ -130,6 +138,8 @@ export async function createApp(overrides = {}) {
     externalSessionsCollector: suppliedExternalSessionsCollector,
     externalSessionSender: suppliedExternalSessionSender,
     externalSessionSubmitter: suppliedExternalSessionSubmitter,
+    externalSessionClearer: suppliedExternalSessionClearer,
+    externalSessionChoiceDismisser: suppliedExternalSessionChoiceDismisser,
     ...configOverrides
   } = overrides;
   const config = { ...(await loadConfig()), ...configOverrides };
@@ -161,7 +171,14 @@ export async function createApp(overrides = {}) {
   const externalSessionSubmitter = suppliedExternalSessionSubmitter || ((session) => (
     submitItermDraft(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
   ));
+  const externalSessionClearer = suppliedExternalSessionClearer || ((session) => (
+    clearItermDraft(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
+  ));
+  const externalSessionChoiceDismisser = suppliedExternalSessionChoiceDismisser || ((session) => (
+    dismissItermChoice(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
+  ));
   const stopReviewInFlight = new Map();
+  const jobRegistry = new JobRegistry({ store });
   const automationEngine = suppliedAutomationEngine || new AutomationEngine({
     config,
     store,
@@ -169,7 +186,13 @@ export async function createApp(overrides = {}) {
     discoverExternalSessions: externalSessionsCollector,
     externalSessionInput: externalSessionSender,
     externalSessionSubmit: externalSessionSubmitter,
-    onExternalSessionStopped: (stop) => queueImmediateStopReview(stop),
+    externalSessionClear: externalSessionClearer,
+    externalSessionDismissChoice: externalSessionChoiceDismisser,
+    // A normal Claude input prompt is a liveness event, not a scientific review
+    // event. Project sessions own milestone Codex calls; portfolio review is
+    // handled separately from the Goal Loop.
+    onExternalSessionStopped: null,
+    jobRegistry,
   });
   const publicDir = join(config.root, 'public');
   let scanPromise = null;
@@ -416,6 +439,29 @@ export async function createApp(overrides = {}) {
       const targets = config.projects.filter((project) => !onlyProjectId || project.id === onlyProjectId);
       const results = [];
       for (const project of targets) {
+        const heartbeat = await readClaudeHistoryHeartbeat(project.path, {
+          claudeProjectsDir: config.claudeProjectsDir,
+        });
+        const activeJobRunIds = (automationEngine.jobsSnapshot?.()?.items || [])
+          .filter((item) => (
+            ['pending', 'running'].includes(item.state)
+            && (item.projectId === project.id || item.runId === project.id
+              || String(item.runId || '').startsWith(`${project.id}_`))
+          ))
+          .map((item) => item.runId);
+        if (heartbeat.constructionLease?.active
+            || heartbeat.waitingForJobRunIds?.length || activeJobRunIds.length) {
+          results.push({
+            projectId: project.id,
+            status: 'deferred',
+            error: heartbeat.constructionLease?.active
+              ? 'construction_lease_active' : 'registered_job_active',
+            constructionLease: heartbeat.constructionLease,
+            waitingForJobRunIds: heartbeat.waitingForJobRunIds || [],
+            activeJobRunIds,
+          });
+          continue;
+        }
         const previous = store.latestSemanticAudit(project.id);
         const activity = await readRecentClaudeActivity(project.path, {
           claudeProjectsDir: config.claudeProjectsDir,
@@ -542,7 +588,9 @@ export async function createApp(overrides = {}) {
             },
             watchdogPollMs: config.watchdog.pollMs,
             stopReviewStableMs: config.watchdog.stopReviewStableMs,
-            activeGoalLoops: store.listAutomationPolicies().filter((item) => item.enabled).length,
+            activeGoalLoops: config.goalLoop?.enabled === true
+              ? store.listAutomationPolicies().filter((item) => item.enabled).length : 0,
+            goalLoopEnabled: config.goalLoop?.enabled === true,
           },
           broker: broker || { embeddedTestDouble: true },
           node: process.version,
@@ -573,7 +621,11 @@ export async function createApp(overrides = {}) {
           status: discovered.status,
           terminalStatus: discovered.terminalStatus,
           items: discovered.items.map((session) => {
-            const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            const rollingSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+            const budgetEpoch = config.goalLoop?.budgetEpoch;
+            const since = [rollingSince, budgetEpoch, session.terminal?.lastRateLimitResetAt]
+              .filter((value) => value && Number.isFinite(Date.parse(value)))
+              .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
             const recentGoal = session.projectId
               ? store.recentGoalActions(session.projectId, since)
               : { count: 0 };
@@ -583,7 +635,7 @@ export async function createApp(overrides = {}) {
               goalPolicy: policies.get(session.projectId),
               goalBudgetReached: recentGoal.count >= config.goalLoop.maxContinuesPerDay,
               schedulerMonitor: automationEngine.monitorSnapshot?.(),
-              queue: automationEngine.snapshot(),
+              jobs: automationEngine.jobsSnapshot?.() || jobRegistry.snapshot(),
             });
             return {
               pid: session.pid,
@@ -625,8 +677,50 @@ export async function createApp(overrides = {}) {
             .map((item) => interventionView(store, item)),
         );
       }
-      if (req.method === 'GET' && url.pathname === '/api/gpu-queue') {
-        return sendJson(res, 200, automationEngine.snapshot());
+      if (req.method === 'GET' && url.pathname === '/api/jobs') {
+        const limitValue = url.searchParams.get('limit');
+        const limit = limitValue === null ? 25 : Number(limitValue);
+        if (!Number.isInteger(limit) || limit < 1 || limit > 200) {
+          throw new SessionError('invalid_job_limit', 'limit must be an integer from 1 to 200', 400);
+        }
+        const historyOnly = url.searchParams.get('view') === 'history';
+        try {
+          return sendJson(res, 200, jobRegistry.snapshot({
+            terminalLimit: limit, cursor: url.searchParams.get('cursor'), historyOnly,
+          }));
+        } catch (error) {
+          throw new SessionError('invalid_job_cursor', error.message, 400);
+        }
+      }
+      const jobMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)$/);
+      if (req.method === 'GET' && jobMatch) {
+        const runId = decodeURIComponent(jobMatch[1]);
+        const job = jobRegistry.get(runId);
+        return job ? sendJson(res, 200, { job, events: jobRegistry.events(runId) })
+          : sendError(res, 404, 'job_not_found', 'Job was not found');
+      }
+      if (req.method === 'POST' && url.pathname === '/api/jobs') {
+        const body = await readJson(req, { allowed: [
+          'runId', 'projectId', 'kind', 'executor', 'state', 'host', 'pid',
+          'pidStartToken', 'commandFingerprint', 'purpose', 'submittedAt',
+          'startedAt', 'heartbeatAt', 'finishedAt', 'progress', 'result', 'metadata', 'source',
+        ], required: ['projectId', 'kind'] });
+        if (!config.projects.some((project) => project.id === body.projectId)) {
+          throw new SessionError('project_not_found', 'Project is not configured', 404);
+        }
+        try { return sendJson(res, 201, jobRegistry.register(body)); }
+        catch (error) { throw new SessionError('invalid_job', error.message, 400); }
+      }
+      const jobStatusMatch = url.pathname.match(/^\/api\/jobs\/([^/]+)\/status$/);
+      if (req.method === 'POST' && jobStatusMatch) {
+        const body = await readJson(req, { allowed: [
+          'state', 'host', 'pid', 'pidStartToken', 'commandFingerprint', 'heartbeatAt', 'finishedAt',
+          'progress', 'result', 'metadata', 'source',
+        ] });
+        try { return sendJson(res, 200, jobRegistry.update(decodeURIComponent(jobStatusMatch[1]), body)); }
+        catch (error) {
+          throw new SessionError(error.message === 'job_not_found' ? 'job_not_found' : 'invalid_job_update', error.message, error.message === 'job_not_found' ? 404 : 409);
+        }
       }
       if (req.method === 'GET' && url.pathname === '/api/automation-events') {
         return sendJson(
@@ -642,7 +736,13 @@ export async function createApp(overrides = {}) {
         return sendJson(res, 200, store.listSessionEpisodes(url.searchParams.get('limit')));
       }
       if (req.method === 'GET' && url.pathname === '/api/automation-policies') {
-        return sendJson(res, 200, store.listAutomationPolicies());
+        const policies = store.listAutomationPolicies().map((policy) => (
+          config.goalLoop?.enabled === true ? policy : { ...policy, enabled: false, objective: '' }
+        ));
+        return sendJson(res, 200, policies);
+      }
+      if (req.method === 'GET' && url.pathname === '/api/project-progress') {
+        return sendJson(res, 200, store.listProjectProgress());
       }
       const scanMatch = url.pathname.match(/^\/api\/scans\/(\d+)$/);
       if (req.method === 'GET' && scanMatch) {
@@ -708,6 +808,13 @@ export async function createApp(overrides = {}) {
         if (typeof body.enabled !== 'boolean') {
           throw new SessionError('invalid_goal_policy', 'enabled must be a boolean');
         }
+        if (body.enabled && config.goalLoop?.enabled !== true) {
+          throw new SessionError(
+            'goal_loop_globally_disabled',
+            'Automatic Goal Loop injection is globally disabled; use routine-choice handling or an explicit manual continuation.',
+            409,
+          );
+        }
         if (typeof body.objective !== 'string' || body.objective.length > 4000
             || (body.enabled && !body.objective.trim())) {
           throw new SessionError(
@@ -721,6 +828,41 @@ export async function createApp(overrides = {}) {
         });
         await automationEngine.cycle();
         return sendJson(res, 200, policy);
+      }
+      const projectProgressMatch = url.pathname.match(/^\/api\/project-progress\/([^/]+)$/);
+      if (req.method === 'POST' && projectProgressMatch) {
+        const targetId = decodeURIComponent(projectProgressMatch[1]);
+        if (!config.projects.some((project) => project.id === targetId)) {
+          throw new SessionError('project_not_found', 'Project is not configured', 404);
+        }
+        const body = await readJson(req, {
+          allowed: ['stage', 'summary', 'reviewedAt', 'source'],
+          required: ['summary', 'reviewedAt'],
+        });
+        if (typeof body.summary !== 'string' || !body.summary.trim()
+            || body.summary.length > 600) {
+          throw new SessionError(
+            'invalid_project_progress',
+            'summary must contain 1-600 characters',
+          );
+        }
+        if (body.stage !== undefined
+            && (typeof body.stage !== 'string' || body.stage.length > 80)) {
+          throw new SessionError('invalid_project_progress', 'stage must contain at most 80 characters');
+        }
+        if (typeof body.reviewedAt !== 'string' || !Number.isFinite(Date.parse(body.reviewedAt))) {
+          throw new SessionError('invalid_project_progress', 'reviewedAt must be an ISO-8601 timestamp');
+        }
+        if (body.source !== undefined
+            && (typeof body.source !== 'string' || !body.source.trim() || body.source.length > 80)) {
+          throw new SessionError('invalid_project_progress', 'source must contain 1-80 characters');
+        }
+        return sendJson(res, 200, store.setProjectProgress(targetId, {
+          stage: String(body.stage || '').trim(),
+          summary: body.summary.trim(),
+          reviewedAt: new Date(body.reviewedAt).toISOString(),
+          source: String(body.source || 'portfolio-review').trim(),
+        }));
       }
       if (req.method === 'GET' && url.pathname === '/api/sessions') {
         return sendJson(res, 200, await sessionManager.list());
@@ -940,11 +1082,13 @@ export async function createApp(overrides = {}) {
     ws.once('close', () => clearInterval(timer));
   });
 
-  // A Web restart can interrupt an in-flight stop review after its durable event
-  // was created. Reattach only events that retain the exact typed stop evidence.
+  // Normal prompt transitions are operational evidence, not review triggers.
+  // Resolve legacy stop-review events instead of reviving the old policy.
   for (const event of store.listPendingAutomationEvents(1000)) {
     if (event.eventType === 'STOP_REVIEW_QUEUED' && event.source?.stop) {
-      queueImmediateStopReview(event.source.stop);
+      store.setAutomationEvent(event.id, {
+        status: 'RESOLVED', note: 'normal_prompt_review_policy_disabled',
+      });
     }
   }
 

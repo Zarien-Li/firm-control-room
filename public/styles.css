@@ -110,6 +110,19 @@ main { width: min(1600px, 100%); margin: auto; padding: 16px; }
   font-size: 12px;
   color: var(--ink);
 }
+.primary-outcome p {
+  margin: 0;
+  display: -webkit-box;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  overflow: hidden;
+}
+.primary-outcome small {
+  display: block;
+  margin-top: 5px;
+  color: var(--muted);
+  font-size: 10px;
+}
 .project-facts {
   display: grid;
   grid-template-columns: 66px minmax(0, 1fr);

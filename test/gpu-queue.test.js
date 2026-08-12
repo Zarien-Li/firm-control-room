@@ -72,6 +72,30 @@ test('GPU efficiency classification is phase-aware and never treats setup as a s
   assert.equal(result.items[0].efficiency.state, 'NON_COMPUTE');
 });
 
+test('GPU efficiency trusts the authoritative worker PID over hidden nvidia-smi process rows', () => {
+  const result = classifyGpuEfficiency({
+    state: 'running', gpuCount: '1', workerAlive: true,
+    telemetry: {
+      phase: 'compute', sampledAt: '2026-08-11T00:10:00Z',
+      progressAt: '2026-08-11T00:09:50Z', windowSec: 300,
+      gpus: [{ utilizationGpuPct: 85, processCount: 0 }],
+    },
+  }, Date.parse('2026-08-11T00:10:00Z'));
+  assert.equal(result.state, 'HEALTHY');
+});
+
+test('GPU efficiency reports a dead authoritative worker as blocked', () => {
+  const result = classifyGpuEfficiency({
+    state: 'running', gpuCount: '1', workerAlive: false,
+    telemetry: {
+      phase: 'compute', sampledAt: '2026-08-11T00:10:00Z', windowSec: 300,
+      gpus: [{ utilizationGpuPct: 0, processCount: 0 }],
+    },
+  }, Date.parse('2026-08-11T00:10:00Z'));
+  assert.equal(result.state, 'BLOCKED');
+  assert.equal(result.reason, 'no_gpu_process_for_120s');
+});
+
 test('GPU efficiency distinguishes progressing low utilization from a stalled run', () => {
   const base = {
     state: 'running', gpuCount: '1',
@@ -143,4 +167,11 @@ test('remote collector command quotes queue roots', () => {
   const command = gpuQueueInternals.remoteCommand("/queue/space's");
   assert.match(command, /python3 -c/);
   assert.match(command, /'"'"'/);
+});
+
+test('remote collector can read a queue inside a fixed Docker container', () => {
+  const command = gpuQueueInternals.remoteCommand('/inside/queue', 'research-container');
+  assert.match(command, /^docker exec 'research-container' python3 -c /);
+  assert.match(command, /'\/inside\/queue'/);
+  assert.doesNotMatch(command, /\b(?:kill|rm)\b/);
 });

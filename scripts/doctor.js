@@ -6,7 +6,6 @@ import { fileURLToPath } from 'node:url';
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REQUIRED_PROJECT_FILES = [
   'CLAUDE-RESEARCH.md',
-  'prompt.txt',
   'PROJECT_IDENTITY.json',
   'PROGRAM_ORIGIN.md',
   'SEED.md',
@@ -81,7 +80,11 @@ if (!(await exists(configPath))) {
     for (const project of projects) {
       const path = resolve(expand(project.path));
       const missing = [];
-      for (const file of REQUIRED_PROJECT_FILES) {
+      const requiredFiles = [
+        ...REQUIRED_PROJECT_FILES,
+        project.bootstrapFile || 'prompt.txt',
+      ];
+      for (const file of requiredFiles) {
         if (!(await exists(join(path, file)))) missing.push(file);
       }
       checks.push({

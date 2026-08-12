@@ -3,13 +3,26 @@ const escapeHtml = (value) => String(value ?? '—').replace(/[&<>"']/g, (char) 
   '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;',
 }[char]));
 
-async function request(path, options) {
-  const response = await fetch(path, options);
-  const body = await response.json();
-  if (!response.ok) {
-    throw new Error(`${body.error?.code || response.status}: ${body.error?.message || response.statusText}`);
+const sleep = (milliseconds) => new Promise((resolve) => setTimeout(resolve, milliseconds));
+
+async function request(path, options = {}) {
+  const method = String(options.method || 'GET').toUpperCase();
+  const attempts = method === 'GET' ? 3 : 1;
+  let lastError = null;
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
+    try {
+      const response = await fetch(path, { ...options, cache: 'no-store' });
+      const body = await response.json();
+      if (!response.ok) {
+        throw new Error(`${body.error?.code || response.status}: ${body.error?.message || response.statusText}`);
+      }
+      return body;
+    } catch (error) {
+      lastError = error;
+      if (attempt + 1 < attempts) await sleep(300 * (2 ** attempt));
+    }
   }
-  return body;
+  throw lastError;
 }
 
 const jsonOptions = (body) => ({
@@ -31,6 +44,7 @@ let lastControlStatus = null;
 let lastProfessorStatus = null;
 let sessionTargetIds = new Set();
 let externalSessionStates = [];
+let dashboardRefreshPromise = null;
 
 function formatTime(value) {
   if (!value) return '未知时间';
@@ -81,7 +95,9 @@ function externalSessionLabel(session) {
     POLICY_HELD: '策略暂停',
     MESSAGE_PENDING_ACK: '消息待确认',
     DRAFT_PENDING_ENTER: '续跑文本待提交',
-    WAITING_FOR_GPU: '等待 GPU 实验',
+    WAITING_FOR_JOB: '等待已注册任务',
+    JOB_ACTIVE_UNDECLARED: '任务运行中（未声明等待）',
+    RATE_LIMITED: '限额等待',
     TOOL_DRAINING: '工具仍在收尾',
     CONFIRMATION_REQUIRED: '等待权限确认',
     MONITORING_IDLE: '监控空闲',
@@ -322,6 +338,7 @@ function render(
   automationEvents = [],
   policies = [],
   professorStatus = {},
+  projectProgress = [],
 ) {
   const { snapshot, audit } = scan;
   const projectSemanticState = (project) => semanticStatus(
@@ -367,13 +384,18 @@ function render(
       const sessionStatus = live?.status || (processSession
         ? `PID ${processSession.pid} · ${processSession.operationalState || processSession.terminal?.state || 'STATE_UNCERTAIN'}` : '未运行');
       const nextAction = liveField(state, 'Next action') || liveField(state, '下一行动') || '等待会话更新 live state';
+      const progress = projectProgress.find((item) => item.targetId === project.id);
+      const progressSummary = progress?.summary || `尚未完成首次五小时组合审查。当前动作：${nextAction}`;
       const semanticState = semanticStatus(semantic);
       return `<article class="project-card">
         <div class="project-head">
           <div><h3>${escapeHtml(project.name)}</h3><span>${escapeHtml(origin.research_arena || project.identity.arena || project.identity.canonicalObject)}</span></div>
           <b class="${verdictClass(semanticState.verdict)}">${escapeHtml(semanticState.verdict)}</b>
         </div>
-        <p class="primary-outcome">${escapeHtml(project.identity.primaryOutcome || 'Primary outcome 尚未读取')}</p>
+        <div class="primary-outcome">
+          <p>${escapeHtml(progressSummary)}</p>
+          <small>${escapeHtml(progress?.stage || '待首次组合审查')} · ${escapeHtml(progress?.reviewedAt ? formatTime(progress.reviewedAt) : '尚未审查')}</small>
+        </div>
         <dl class="project-facts">
           <dt>Session</dt><dd data-session-project="${escapeHtml(project.id)}">${escapeHtml(sessionStatus)}</dd>
           <dt>有效进展</dt><dd data-heartbeat-project="${escapeHtml(project.id)}">${escapeHtml(heartbeatLabel(processSession?.heartbeat))}</dd>
@@ -423,17 +445,20 @@ function render(
     .map((state) => `<div class="queue-count queue-${state}"><strong>${escapeHtml(queueCounts[state] || 0)}</strong><span>${state}</span></div>`)
     .join('');
   const queueItems = [...(gpuQueue.items || [])]
-    .sort((a, b) => String(b.signalAt || '').localeCompare(String(a.signalAt || '')))
+    .sort((a, b) => String(b.updatedAt || '').localeCompare(String(a.updatedAt || '')))
     .slice(0, 10);
-  $('#gpu-queue-items').innerHTML = queueItems.length ? queueItems.map((item) => `
+  $('#gpu-queue-items').innerHTML = queueItems.length ? queueItems.map((item) => {
+    const gpu = item.metadata || {};
+    return `
     <article class="queue-item">
       <b class="queue-state queue-${escapeHtml(item.state)}">${escapeHtml(item.state)}</b>
-      <span><strong>${escapeHtml(item.runId)}</strong><small>${escapeHtml(item.project || '未映射项目')} · ${escapeHtml(item.telemetry?.phase || '阶段未知')} · ${escapeHtml(formatTime(item.signalAt))}</small></span>
+      <span><strong>${escapeHtml(item.runId)}</strong><small>${escapeHtml(item.projectId || '未映射项目')} · ${escapeHtml(item.kind)} / ${escapeHtml(item.executor)} · ${escapeHtml(formatTime(item.updatedAt))}</small></span>
       <div class="queue-diagnostics">
-        <code class="readiness readiness-${escapeHtml(String(item.submissionReadiness?.state || 'undeclared').toLowerCase())}" title="${escapeHtml((item.submissionReadiness?.missing || []).join(', ') || 'GPU submission preparation complete')}">${escapeHtml(item.submissionReadiness?.state || 'UNDECLARED')}</code>
-        <code class="efficiency efficiency-${escapeHtml(String(item.efficiency?.state || 'unmeasured').toLowerCase())}" title="${escapeHtml(item.efficiency?.recommendation || item.remotePath)}">${escapeHtml(item.efficiency?.state || 'UNMEASURED')}${Number.isFinite(item.efficiency?.averageUtilizationPct) ? ` · ${item.efficiency.averageUtilizationPct.toFixed(1)}%` : ''}</code>
+        <code class="readiness readiness-${escapeHtml(String(gpu.submissionReadiness?.state || 'registered').toLowerCase())}">${escapeHtml(gpu.submissionReadiness?.state || 'REGISTERED')}</code>
+        <code class="efficiency efficiency-${escapeHtml(String(gpu.efficiency?.state || 'tracked').toLowerCase())}" title="${escapeHtml(gpu.efficiency?.recommendation || item.purpose || '')}">${escapeHtml(gpu.efficiency?.state || 'TRACKED')}${Number.isFinite(gpu.efficiency?.averageUtilizationPct) ? ` · ${gpu.efficiency.averageUtilizationPct.toFixed(1)}%` : ''}</code>
       </div>
-    </article>`).join('') : '<div class="empty">当前没有带权威 signal 的 GPU queue 条目</div>';
+    </article>`;
+  }).join('') : '<div class="empty">当前没有已注册任务</div>';
   const pendingAutomation = automationEvents.filter((item) => ['PENDING', 'HELD', 'SENT'].includes(item.status));
   $('#automation-inbox-section').hidden = !pendingAutomation.length;
   $('#automation-events').innerHTML = pendingAutomation.map((item) => {
@@ -441,7 +466,7 @@ function render(
       session.projectId === item.targetId && ['RUNNING', 'WAITING_INPUT'].includes(session.status)
     ));
     const canSend = ['PENDING', 'HELD'].includes(item.status)
-      && ['gpu_queue', 'gpu_efficiency'].includes(item.category)
+      && ['gpu_queue', 'gpu_efficiency', 'job_registry'].includes(item.category)
       && managedTarget?.status === 'WAITING_INPUT';
     return `<article class="automation-event event-${escapeHtml(item.severity)}">
       <b>${escapeHtml(item.eventType)}</b>
@@ -517,14 +542,16 @@ async function refresh(scanResult) {
     automationEvents,
     policies,
     professorStatus,
+    projectProgress,
   ] = await Promise.all([
     request('/api/scans'),
     request('/api/semantic-audits?limit=100'),
     request('/api/interventions?limit=100'),
-    request('/api/gpu-queue'),
+    request('/api/jobs'),
     request('/api/automation-events?limit=200'),
     request('/api/automation-policies'),
     request('/api/professor-status'),
+    request('/api/project-progress'),
   ]);
   if (!history.length && !scanResult) return;
   const scan = scanResult || await request(`/api/scans/${history[0].id}`);
@@ -534,9 +561,23 @@ async function refresh(scanResult) {
   automationPolicies = policies;
   lastRenderPayload = [
     scan, history, latestSemantic, interventions, gpuQueue, automationEvents, policies,
-    professorStatus,
+    professorStatus, projectProgress,
   ];
   render(...lastRenderPayload);
+}
+
+async function refreshDashboardResilient() {
+  if (dashboardRefreshPromise) return dashboardRefreshPromise;
+  dashboardRefreshPromise = refresh()
+    .then(() => {
+      const updated = $('#updated');
+      if (updated?.textContent?.startsWith('载入失败：')) updated.textContent = '连接已恢复';
+    })
+    .catch((error) => {
+      $('#updated').textContent = `载入失败：${error.message} · 正在自动重试`;
+    })
+    .finally(() => { dashboardRefreshPromise = null; });
+  return dashboardRefreshPromise;
 }
 
 $('#scan').addEventListener('click', async (event) => {
@@ -586,7 +627,7 @@ $('#semantic-scan').addEventListener('click', async (event) => {
   }
 });
 
-refresh().catch((error) => { $('#updated').textContent = `载入失败：${error.message}`; });
+refreshDashboardResilient();
 const terminal = new window.Terminal({
   cursorBlink: true,
   convertEol: false,
@@ -821,3 +862,8 @@ setInterval(() => {
     $('#session-status').textContent = `外部会话状态读取失败：${error.message}`;
   });
 }, 15000);
+setInterval(refreshDashboardResilient, 60000);
+window.addEventListener('online', refreshDashboardResilient);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'visible') refreshDashboardResilient();
+});

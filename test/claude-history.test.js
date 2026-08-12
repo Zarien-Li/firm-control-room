@@ -100,7 +100,7 @@ test('heartbeat retains assistant liveness when one JSONL event exceeds the old 
   }
 });
 
-test('heartbeat extracts an explicit GPU wait declaration only from the latest assistant event', async () => {
+test('heartbeat extracts only the single registered-job wait marker', async () => {
   const root = await mkdtemp(join(tmpdir(), 'firm-claude-gpu-wait-'));
   const projectPath = '/Users/example/research/ACL_1';
   const directory = join(root, claudeProjectDirectoryName(projectPath));
@@ -109,7 +109,7 @@ test('heartbeat extracts an explicit GPU wait declaration only from the latest a
     {
       type: 'assistant', uuid: 'wait-assistant', timestamp: '2026-08-11T00:04:00Z',
       message: { role: 'assistant', content: [{
-        type: 'text', text: 'All independent work is done.\n[FIRM WAITING_FOR_GPU run_id=ACL_1_train_1]',
+        type: 'text', text: 'Old marker is ignored: [FIRM WAITING_FOR_GPU run_id=old].\n[FIRM WAITING_FOR_JOB run_id=ACL_1_train_1]',
       }] },
     },
     { type: 'system', subtype: 'turn_duration', timestamp: '2026-08-11T00:04:01Z' },
@@ -117,7 +117,43 @@ test('heartbeat extracts an explicit GPU wait declaration only from the latest a
   await writeFile(join(directory, 'session.jsonl'), `${lines.map(JSON.stringify).join('\n')}\n`);
   try {
     const heartbeat = await readClaudeHistoryHeartbeat(projectPath, { claudeProjectsDir: root });
-    assert.deepEqual(heartbeat.waitingForGpuRunIds, ['ACL_1_train_1']);
+    assert.deepEqual(heartbeat.waitingForJobRunIds, ['ACL_1_train_1']);
+    assert.equal('waitingForGpuRunIds' in heartbeat, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('heartbeat carries a construction lease until a matching terminal marker appears', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-claude-construction-lease-'));
+  const projectPath = '/Users/example/research/ACL_1';
+  const directory = join(root, claudeProjectDirectoryName(projectPath));
+  await mkdir(directory);
+  const path = join(directory, 'session.jsonl');
+  const active = {
+    type: 'assistant', uuid: 'lease-active', timestamp: '2026-08-11T00:05:00Z',
+    message: { role: 'assistant', content: [{
+      type: 'text', text: '[FIRM CONSTRUCTION_LEASE id=method-v1 state=active]',
+    }] },
+  };
+  await writeFile(path, `${JSON.stringify(active)}\n`);
+  try {
+    let heartbeat = await readClaudeHistoryHeartbeat(projectPath, { claudeProjectsDir: root });
+    assert.deepEqual(heartbeat.constructionLease, {
+      id: 'method-v1', state: 'active', active: true, observedAt: '2026-08-11T00:05:00Z',
+    });
+    assert.equal(heartbeat.latestAssistantText,
+      '[FIRM CONSTRUCTION_LEASE id=method-v1 state=active]');
+    const complete = {
+      type: 'assistant', uuid: 'lease-complete', timestamp: '2026-08-11T00:06:00Z',
+      message: { role: 'assistant', content: [{
+        type: 'text', text: '[FIRM CONSTRUCTION_LEASE id=method-v1 state=complete]',
+      }] },
+    };
+    await writeFile(path, `${JSON.stringify(active)}\n${JSON.stringify(complete)}\n`);
+    heartbeat = await readClaudeHistoryHeartbeat(projectPath, { claudeProjectsDir: root });
+    assert.equal(heartbeat.constructionLease.active, false);
+    assert.equal(heartbeat.constructionLease.state, 'complete');
   } finally {
     await rm(root, { recursive: true, force: true });
   }

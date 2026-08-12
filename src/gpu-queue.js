@@ -64,6 +64,11 @@ for state, signal in states:
         request = fields(request_text)
         result = fields(result_text)
         status_json = safe_json(os.path.join(entry.path, "status.json"))
+        worker_alive = None
+        if state == "running" and isinstance(status_json, dict):
+            worker_pid = status_json.get("container_pid")
+            if isinstance(worker_pid, int) and worker_pid > 0:
+                worker_alive = os.path.exists(f"/proc/{worker_pid}")
         telemetry_json = safe_json(os.path.join(entry.path, "telemetry.json"))
         if telemetry_json is None:
             telemetry_json = safe_json(os.path.join(entry.path, "TELEMETRY.json"))
@@ -104,6 +109,7 @@ for state, signal in states:
             "summary": result.get("summary"),
             "nextAction": result.get("next_action_for_project_session"),
             "statusDetail": status_json,
+            "workerAlive": worker_alive,
             "telemetry": telemetry_json,
         })
 
@@ -119,10 +125,13 @@ function quoteRemote(value) {
   return `'${String(value).replaceAll("'", `'"'"'`)}'`;
 }
 
-function remoteCommand(root) {
+function remoteCommand(root, dockerContainer = null) {
   const script = Buffer.from(REMOTE_COLLECTOR).toString('base64');
   const launcher = `import base64;exec(base64.b64decode('${script}'))`;
-  return `python3 -c ${quoteRemote(launcher)} ${quoteRemote(root)}`;
+  const python = `python3 -c ${quoteRemote(launcher)} ${quoteRemote(root)}`;
+  return dockerContainer
+    ? `docker exec ${quoteRemote(dockerContainer)} ${python}`
+    : python;
 }
 
 export function emptyGpuQueueSnapshot(status = 'disabled', error = null) {
@@ -272,7 +281,7 @@ export function classifyGpuEfficiency(item, now = Date.now()) {
   const progressAgeMs = isoAgeMs(telemetry.progressAt, now);
   const sampleAgeMs = isoAgeMs(telemetry.sampledAt, now);
   const common = { averageUtilizationPct, averageMemoryPct, activeGpus: active, expectedGpus: expected };
-  if (hasProcessSamples && processTotal === 0
+  if (item.workerAlive === false && hasProcessSamples && processTotal === 0
       && (telemetry.windowSec >= 120 || sampleAgeMs >= 120_000)) {
     return {
       ...common, state: 'BLOCKED', severity: 'error', reason: 'no_gpu_process_for_120s',
@@ -341,6 +350,7 @@ export function normalizeGpuQueueSnapshot(value) {
       nextAction: typeof item.nextAction === 'string' ? item.nextAction.slice(0, 4000) : null,
       statusDetail: item.statusDetail && typeof item.statusDetail === 'object'
         ? item.statusDetail : null,
+      workerAlive: typeof item.workerAlive === 'boolean' ? item.workerAlive : null,
       telemetry: normalizeTelemetry(item.telemetry),
       };
       normalized.efficiency = classifyGpuEfficiency(
@@ -371,7 +381,7 @@ export async function collectGpuQueue(config, options = {}) {
     '-o', 'BatchMode=yes',
     '-o', `ConnectTimeout=${Math.max(1, Math.ceil(config.timeoutMs / 1000))}`,
     config.host,
-    remoteCommand(config.root),
+    remoteCommand(config.root, config.dockerContainer),
   ];
   try {
     const { stdout } = await run(config.sshExecutable, args, {

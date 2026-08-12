@@ -115,8 +115,12 @@ function processDescendants(pid, processes) {
 
 function isPersistentClaudeInfrastructure(process) {
   if (process.isClaude) return true;
-  return /(?:\bcaffeinate\b|\bmcp-server\b|model-context-protocol|server-sequential-thinking)/i
+  return /(?:\bcaffeinate\b|\bmcp-server\b|model-context-protocol|server-sequential-thinking|glm_mcp_clone\.server|zai-mcp-server|codex-code-mode-host)/i
     .test(process.command);
+}
+
+function isLiveRemoteTool(process) {
+  return /(?:^|[\s/'"])(?:ssh|scp|sftp|rsync)(?:\s|$)/i.test(process.command);
 }
 
 function toolProcessHeartbeat(pid, processes) {
@@ -125,6 +129,9 @@ function toolProcessHeartbeat(pid, processes) {
   const active = tools.filter((process) => (
     /[RD]/.test(process.processState || '')
     || (Number.isFinite(process.cpuPct) && process.cpuPct >= 0.5)
+    // ssh commonly sleeps locally while the remote training/evaluation process
+    // is busy. Its continued presence is a live dependency, not an idle prompt.
+    || isLiveRemoteTool(process)
   ));
   const kinds = [...new Set(tools.map((process) => basename(process.executable || process.command)))]
     .filter(Boolean).slice(0, 8);
@@ -178,7 +185,9 @@ async function sessionHeartbeat(session, project, processes, options) {
     historyEventId: history.latestEventId || null,
     historyEventType: history.latestEventType || null,
     latestAssistantAt: history.latestAssistantAt || null,
-    waitingForGpuRunIds: history.waitingForGpuRunIds || [],
+    latestAssistantText: history.latestAssistantText || null,
+    waitingForJobRunIds: history.waitingForJobRunIds || [],
+    constructionLease: history.constructionLease || null,
     deliveryMarkers: history.deliveryMarkers || [],
     episodeId: sha256(episodeBasis).slice(0, 24),
     projectWriteAt: projectFiles.latestWriteAt,
@@ -358,11 +367,15 @@ function sha256(value) {
 }
 
 async function readAllowedFile(project, name) {
-  const path = join(project.path, name);
+  const sourceName = name === 'prompt.txt'
+    ? (project.bootstrapFile || name)
+    : name;
+  const path = join(project.path, sourceName);
   try {
     const content = await readFile(path, 'utf8');
     return {
       name,
+      sourceName,
       path,
       status: 'ok',
       bytes: Buffer.byteLength(content),
@@ -372,6 +385,7 @@ async function readAllowedFile(project, name) {
   } catch (error) {
     return {
       name,
+      sourceName,
       path,
       status: 'missing',
       reason: error.code === 'ENOENT' ? 'file_missing' : 'file_unreadable',

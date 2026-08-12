@@ -42,7 +42,44 @@ test('Professor status is a stateless Codex engine with the configured cadence',
   }
 });
 
-test('a newly stopped external project queues immediate review outside the cadence', async () => {
+test('portfolio review progress is persisted and exposed for project cards', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-project-progress-'));
+  const project = { id: 'P', name: 'P', path: root, expected: {} };
+  const manager = new SessionManager({
+    projects: [project], executable: '/fixed/claude', controlDir: join(root, 'control'),
+    pty: new FakePty(),
+  });
+  const app = await createApp({
+    dataDir: join(root, 'data'), projects: [project], codexAuditEnabled: false,
+    gpuQueue: { enabled: false, pollMs: 1000, schedulerAutoStart: false },
+    sessionManager: manager,
+  });
+  try {
+    const address = await app.listen(0, '127.0.0.1');
+    const base = `http://127.0.0.1:${address.port}`;
+    const saved = await fetch(`${base}/api/project-progress/P`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        stage: 'construction-v1',
+        summary: 'v1 is training against the nearest rival; utility check is pending.',
+        reviewedAt: '2026-08-12T00:00:00Z',
+        source: 'five-hour-portfolio-review',
+      }),
+    });
+    assert.equal(saved.status, 200);
+    const list = await fetch(`${base}/api/project-progress`).then((response) => response.json());
+    assert.equal(list.length, 1);
+    assert.equal(list[0].targetId, 'P');
+    assert.equal(list[0].stage, 'construction-v1');
+    assert.match(list[0].summary, /nearest rival/);
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a newly stopped external project does not turn liveness into scientific review', async () => {
   const root = await mkdtemp(join(tmpdir(), 'firm-stop-review-'));
   const project = { id: 'P', name: 'P', path: root, expected: {} };
   const manager = new SessionManager({
@@ -69,22 +106,14 @@ test('a newly stopped external project queues immediate review outside the caden
   });
   try {
     await app.automationEngine.cycle({ forceQueue: true });
-    for (let attempt = 0; attempt < 500; attempt += 1) {
-      const event = app.store.listAutomationEvents(10)
-        .find((item) => item.eventType === 'STOP_REVIEW_QUEUED');
-      if (event?.status === 'RESOLVED') break;
-      await new Promise((resolve) => setTimeout(resolve, 10));
-    }
     const events = app.store.listAutomationEvents(10)
       .filter((item) => item.eventType === 'STOP_REVIEW_QUEUED');
-    assert.equal(events.length, 1);
-    assert.equal(events[0].status, 'RESOLVED');
-    assert.match(events[0].note, /immediate_stop_review_disabled/);
+    assert.equal(events.length, 0);
     await app.automationEngine.cycle({ forceQueue: true });
     assert.equal(
       app.store.listAutomationEvents(10)
         .filter((item) => item.eventType === 'STOP_REVIEW_QUEUED').length,
-      1,
+      0,
     );
   } finally {
     await app.close();
@@ -97,7 +126,7 @@ test('a newly stopped external project queues immediate review outside the caden
   }
 });
 
-test('a restart resumes a durable in-flight stop review instead of leaving a Goal blocker', async () => {
+test('a restart resolves a legacy stop review instead of reviving obsolete policy', async () => {
   const root = await mkdtemp(join(tmpdir(), 'firm-stop-review-restart-'));
   const project = { id: 'P', name: 'P', path: root, expected: {} };
   let seedStore = await createStore(join(root, 'data'));
@@ -134,7 +163,7 @@ test('a restart resumes a durable in-flight stop review instead of leaving a Goa
     }
     const event = app.store.getAutomationEvent('stop-review:P:42:wait-restart');
     assert.equal(event.status, 'RESOLVED');
-    assert.equal(event.note, 'immediate_stop_review_disabled');
+    assert.equal(event.note, 'normal_prompt_review_policy_disabled');
   } finally {
     await app.close();
     const evidenceRoot = join(root, 'data', 'evidence');

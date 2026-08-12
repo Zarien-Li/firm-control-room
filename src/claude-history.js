@@ -7,7 +7,8 @@ const HEARTBEAT_TAIL_BYTES = 1024 * 1024;
 const MAX_MESSAGES = 80;
 const MAX_TEXT_CHARS = 48 * 1024;
 const DELIVERY_MARKER = /\[FIRM DELIVERY ([^\]\r\n]+)\]/g;
-const GPU_WAIT_MARKER = /\[FIRM WAITING_FOR_GPU run_id=([A-Za-z0-9._:-]+)\]/g;
+const JOB_WAIT_MARKER = /\[FIRM WAITING_FOR_JOB run_id=([A-Za-z0-9._:-]+)\]/g;
+const CONSTRUCTION_LEASE_MARKER = /\[FIRM CONSTRUCTION_LEASE id=([A-Za-z0-9._:-]+) state=(active|complete|released)\]/g;
 
 export function claudeProjectDirectoryName(projectPath) {
   return projectPath.replace(/[^A-Za-z0-9]/g, '-');
@@ -32,7 +33,9 @@ export async function readClaudeHistoryHeartbeat(projectPath, {
       latestEventId: null,
       latestEventType: null,
       latestAssistantAt: null,
-      waitingForGpuRunIds: [],
+      latestAssistantText: null,
+      waitingForJobRunIds: [],
+      constructionLease: null,
       deliveryMarkers: [],
     };
   }
@@ -58,7 +61,9 @@ export async function readClaudeHistoryHeartbeat(projectPath, {
       latestEventId: null,
       latestEventType: null,
       latestAssistantAt: null,
-      waitingForGpuRunIds: [],
+      latestAssistantText: null,
+      waitingForJobRunIds: [],
+      constructionLease: null,
       deliveryMarkers: [],
     };
     try {
@@ -88,7 +93,9 @@ export async function readClaudeHistoryHeartbeat(projectPath, {
     latestEventId: null,
     latestEventType: null,
     latestAssistantAt: null,
-    waitingForGpuRunIds: [],
+    latestAssistantText: null,
+    waitingForJobRunIds: [],
+    constructionLease: null,
     deliveryMarkers: [],
   };
 }
@@ -146,7 +153,9 @@ function parseHeartbeatTail(tail, sourceFile) {
   let latestEventId = null;
   let latestEventType = null;
   let latestAssistantAt = null;
-  let waitingForGpuRunIds = [];
+  let latestAssistantText = null;
+  let waitingForJobRunIds = [];
+  let constructionLease = null;
   const markers = [];
   for (const line of tail.split('\n')) {
     if (!line.trim()) continue;
@@ -159,8 +168,15 @@ function parseHeartbeatTail(tail, sourceFile) {
         latestEventType = 'assistant';
         latestAssistantAt = value.timestamp || value.message?.timestamp || latestAssistantAt;
         const assistantText = textParts(value.message.content).join('\n');
-        waitingForGpuRunIds = [...assistantText.matchAll(GPU_WAIT_MARKER)]
+        latestAssistantText = assistantText.trim().slice(-4000) || latestAssistantText;
+        waitingForJobRunIds = [...assistantText.matchAll(JOB_WAIT_MARKER)]
           .map((match) => match[1]);
+        for (const match of assistantText.matchAll(CONSTRUCTION_LEASE_MARKER)) {
+          constructionLease = {
+            id: match[1], state: match[2], active: match[2] === 'active',
+            observedAt: value.timestamp || value.message?.timestamp || null,
+          };
+        }
       } else if (event) {
         latestEventId = stableEventId(value, line);
         latestEventType = event.role;
@@ -183,7 +199,9 @@ function parseHeartbeatTail(tail, sourceFile) {
     latestEventId,
     latestEventType,
     latestAssistantAt,
-    waitingForGpuRunIds: [...new Set(waitingForGpuRunIds)].slice(-8),
+    latestAssistantText,
+    waitingForJobRunIds: [...new Set(waitingForJobRunIds)].slice(-8),
+    constructionLease,
     deliveryMarkers: [...new Set(markers)].slice(-16),
   };
 }

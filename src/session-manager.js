@@ -9,17 +9,19 @@ import {
   writeFileSync,
 } from 'node:fs';
 import { isAbsolute, join } from 'node:path';
+import { classifyItermTail } from './iterm-status.js';
 
 export const SESSION_STATES = Object.freeze([
   'CREATING',
   'RUNNING',
+  'RATE_LIMITED',
   'WAITING_INPUT',
   'STOPPING',
   'EXITED',
   'FAILED',
   'LOST',
 ]);
-const ACTIVE_STATES = new Set(['RUNNING', 'WAITING_INPUT']);
+const ACTIVE_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'WAITING_INPUT']);
 const CLAUDE_READY_PATTERN = /(?:^|[\r\n])\s*❯(?!\s*\d+\.)[^\r\n]*/;
 const CONFIRMATION_PATTERN = /do you want to proceed|would you like to|press enter to continue|enter to confirm|allow this action|quick safety check/i;
 const WAITING_PATTERN = new RegExp(
@@ -158,6 +160,8 @@ export class SessionManager {
       cursor: 0,
       recentOutput: '',
       stateTimer: null,
+      rateLimitTimer: null,
+      rateLimitResetAt: null,
       bootstrapPrompt,
       bootstrapStatus: bootstrapEnabled ? 'PENDING' : 'DISABLED',
       bootstrapSentAt: null,
@@ -342,7 +346,30 @@ export class SessionManager {
       session.bootstrapNeedsRetry = session.bootstrapStatus === 'SENT';
     }
     if (session.stateTimer) clearTimeout(session.stateTimer);
-    session.stateTimer = setTimeout(() => {
+    if (session.rateLimitTimer) clearTimeout(session.rateLimitTimer);
+    const terminalState = classifyItermTail(session.recentOutput, { now: this.now() });
+    if (terminalState.state === 'RATE_LIMITED') {
+      session.status = 'RATE_LIMITED';
+      session.rateLimitResetAt = terminalState.resetAt;
+      session.waitReason = 'provider_rate_limit';
+      const delay = Math.max(0, Date.parse(terminalState.resetAt) - this.now().getTime()) + 250;
+      session.rateLimitTimer = setTimeout(() => {
+        session.rateLimitTimer = null;
+        if (session.status !== 'RATE_LIMITED'
+            || session.rateLimitResetAt !== terminalState.resetAt) return;
+        session.status = 'WAITING_INPUT';
+        session.waitingSince = this.now().toISOString();
+        session.waitReason = 'provider_rate_limit_reset_elapsed';
+        this.#persist(session);
+        this.#record(session, {
+          type: 'state', at: this.now().toISOString(), status: session.status,
+          reason: 'provider_rate_limit_reset_elapsed', resetAt: terminalState.resetAt,
+        });
+      }, delay);
+      session.rateLimitTimer.unref?.();
+    } else {
+      session.rateLimitResetAt = terminalState.lastRateLimitResetAt || null;
+      session.stateTimer = setTimeout(() => {
       session.stateTimer = null;
       if (session.status === 'RUNNING' && WAITING_PATTERN.test(session.recentOutput.trimEnd())) {
         session.status = 'WAITING_INPUT';
@@ -361,8 +388,9 @@ export class SessionManager {
           this.#sendBootstrap(session, 'claude_ready_prompt');
         }
       }
-    }, 250);
-    session.stateTimer.unref?.();
+      }, 250);
+      session.stateTimer.unref?.();
+    }
     this.#persist(session);
     this.#record(session, {
       type: 'output',
@@ -376,6 +404,9 @@ export class SessionManager {
     if (session.status === 'EXITED') return;
     if (session.stateTimer) clearTimeout(session.stateTimer);
     session.stateTimer = null;
+    if (session.rateLimitTimer) clearTimeout(session.rateLimitTimer);
+    session.rateLimitTimer = null;
+    session.rateLimitResetAt = null;
     session.status = 'EXITED';
     session.exitedAt = this.now().toISOString();
     session.exitCode = Number.isInteger(event.exitCode) ? event.exitCode : null;
@@ -408,6 +439,9 @@ export class SessionManager {
     }
     if (session.stateTimer) clearTimeout(session.stateTimer);
     session.stateTimer = null;
+    if (session.rateLimitTimer) clearTimeout(session.rateLimitTimer);
+    session.rateLimitTimer = null;
+    session.rateLimitResetAt = null;
     session.recentOutput = '';
     session.status = 'RUNNING';
     session.lastActivityAt = this.now().toISOString();
@@ -478,12 +512,13 @@ export class SessionManager {
           cursor: allOutput.length,
           recentOutput: '',
           stateTimer: null,
+          rateLimitTimer: null,
           lastActivityAt: saved.lastActivityAt || saved.createdAt || null,
           lastOutputAt: saved.lastOutputAt || null,
           waitingSince: saved.waitingSince || null,
           waitReason: saved.waitReason || null,
         };
-        if (['CREATING', 'RUNNING', 'WAITING_INPUT', 'STOPPING'].includes(session.status)) {
+        if (['CREATING', 'RUNNING', 'RATE_LIMITED', 'WAITING_INPUT', 'STOPPING'].includes(session.status)) {
           session.status = 'LOST';
           session.exitedAt = this.now().toISOString();
           this.#record(session, {
@@ -518,6 +553,7 @@ export class SessionManager {
       lastOutputAt: session.lastOutputAt || null,
       waitingSince: session.waitingSince || null,
       waitReason: session.waitReason || null,
+      rateLimitResetAt: session.rateLimitResetAt || null,
       exitedAt: session.exitedAt,
       exitCode: session.exitCode,
       signal: session.signal,

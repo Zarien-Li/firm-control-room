@@ -30,6 +30,10 @@ test('operational state separates model work, tools, review, policy, and deliver
   assert.equal(deriveOperationalState(session('WORKING'), {
     goalBudgetReached: true,
   }).state, 'MODEL_WORKING');
+  assert.equal(deriveOperationalState({
+    ...session('RATE_LIMITED'),
+    terminal: { state: 'RATE_LIMITED', resetAt: '2026-08-11T16:17:28.000Z' },
+  }).state, 'RATE_LIMITED');
   assert.equal(deriveOperationalState(session('WORKING'), {
     outbox: [{ targetId: 'P', messageKey: 'm1', status: 'SENT_AWAITING_ACK' }],
   }).state, 'MESSAGE_PENDING_ACK');
@@ -53,19 +57,52 @@ test('scheduler monitoring idle is an explicit healthy state', () => {
   assert.equal(value.state, 'MONITORING_IDLE');
 });
 
-test('a verified active GPU dependency is an acceptable waiting state', () => {
+test('a verified active registered dependency is an acceptable waiting state', () => {
   const value = deriveOperationalState({
     projectId: 'P',
     terminal: { state: 'WAITING_INPUT' },
     heartbeat: {
       status: 'ok', activeToolProcessCount: 0,
-      waitingForGpuRunIds: ['P_train_1'],
+      waitingForJobRunIds: ['P_train_1'],
     },
   }, {
     goalPolicy: { enabled: true },
     events: [{ targetId: 'P', status: 'PENDING', eventType: 'STOP_REVIEW_QUEUED' }],
-    queue: { items: [{ runId: 'P_train_1', project: 'P', state: 'running' }] },
+    jobs: { items: [{ runId: 'P_train_1', projectId: 'P', kind: 'gpu', state: 'running' }] },
   });
-  assert.equal(value.state, 'WAITING_FOR_GPU');
+  assert.equal(value.state, 'WAITING_FOR_JOB');
   assert.match(value.reason, /P_train_1/);
+});
+
+test('an active construction lease suppresses generic continuation state', () => {
+  const value = deriveOperationalState(session('WAITING_INPUT', {
+    constructionLease: { id: 'method-v1', state: 'active', active: true },
+  }), {
+    goalPolicy: { enabled: true },
+  });
+  assert.equal(value.state, 'CONSTRUCTION_ACTIVE');
+  assert.match(value.reason, /method-v1/);
+});
+
+test('an authoritative active job stays silent even when Claude omitted the marker', () => {
+  const value = deriveOperationalState({
+    projectId: 'ACL_1',
+    terminal: { state: 'WAITING_INPUT' },
+    heartbeat: { status: 'ok', waitingForJobRunIds: [] },
+  }, {
+    jobs: { items: [{ runId: 'ACL_1_train', projectId: 'ACL_1', kind: 'gpu', state: 'running' }] },
+  });
+  assert.equal(value.state, 'JOB_ACTIVE_UNDECLARED');
+  assert.match(value.reason, /suppress scientific review or generic continuation/);
+});
+
+test('an uncertain transport is quarantined and does not block the session', () => {
+  const value = deriveOperationalState({
+    projectId: 'P', terminal: { state: 'WAITING_INPUT' },
+    heartbeat: { status: 'ok', waitingForJobRunIds: [] },
+  }, {
+    outbox: [{ targetId: 'P', status: 'UNCERTAIN', messageKey: 'old' }],
+    jobs: { items: [] },
+  });
+  assert.notEqual(value.state, 'MESSAGE_PENDING_ACK');
 });

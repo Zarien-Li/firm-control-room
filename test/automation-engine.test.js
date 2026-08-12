@@ -15,7 +15,7 @@ function config() {
       schedulerAutoStart: true,
     },
     watchdog: { waitingMs: 60_000, stopReviewStableMs: 10_000 },
-    goalLoop: { graceMs: 10_000, cooldownMs: 60_000, maxContinuesPerDay: 6 },
+    goalLoop: { enabled: true, graceMs: 10_000, cooldownMs: 60_000, maxContinuesPerDay: 6 },
   };
 }
 
@@ -69,6 +69,114 @@ async function fixture(fn) {
   }
 }
 
+test('global Goal Loop disable overrides persisted per-project policies', async () => {
+  await fixture(async (store) => {
+    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Sensitive full objective.' });
+    const disabled = config();
+    disabled.goalLoop.enabled = false;
+    const sessions = new FakeSessions([{
+      id: 'research-disabled', projectId: 'ACL_1', status: 'WAITING_INPUT',
+      bootstrapStatus: 'SENT', waitingSince: '2026-08-11T00:00:00Z',
+    }]);
+    const engine = new AutomationEngine({
+      config: disabled, store, sessionManager: sessions,
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:02:00Z', root: '/queue', items: [],
+        invalid: [], counts: { pending: 0, running: 0, done: 0, failed: 0, cancelled: 0 },
+      }),
+      now: () => new Date('2026-08-11T00:02:00Z'),
+    });
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sessions.inputs.length, 0);
+    assert.equal(store.listAutomationEvents(20).some((item) => item.eventType === 'GOAL_CONTINUED'), false);
+  });
+});
+
+test('routine questions are self-resolved without enabling Goal Loop or repeating objectives', async () => {
+  await fixture(async (store) => {
+    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Sensitive full objective.' });
+    const disabled = config();
+    disabled.goalLoop.enabled = false;
+    const sent = [];
+    const session = {
+      pid: 110, projectId: 'ACL_1', tty: '/dev/ttys110',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'ordinary-question' },
+      heartbeat: {
+        historyCursor: 's:1:a', deliveryMarkers: [],
+        latestAssistantAt: '2026-08-11T00:00:00Z',
+        latestAssistantText: 'The baseline is ready. Should I run the matched component comparison next?',
+      },
+    };
+    const engine = new AutomationEngine({
+      config: disabled, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+    });
+    await engine.cycle();
+    await engine.cycle();
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /ROUTINE-QUESTION RESPONSE/);
+    assert.doesNotMatch(sent[0], /Sensitive full objective/);
+    assert.equal(store.listAutomationEvents(20).some((item) => (
+      item.eventType === 'ROUTINE_QUESTION_RETURNED_TO_CLAUDE'
+    )), true);
+    assert.equal(store.listAutomationEvents(20).some((item) => item.eventType === 'GOAL_CONTINUED'), false);
+  });
+});
+
+test('human-owned questions remain untouched', async () => {
+  await fixture(async (store) => {
+    const disabled = config();
+    disabled.goalLoop.enabled = false;
+    const sent = [];
+    const session = {
+      pid: 111, projectId: 'ACL_1', tty: '/dev/ttys111',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'permission-question' },
+      heartbeat: {
+        historyCursor: 's:1:a', deliveryMarkers: [],
+        latestAssistantAt: '2026-08-11T00:00:00Z',
+        latestAssistantText: 'May I delete the dataset and change the paper contribution type?',
+      },
+    };
+    const engine = new AutomationEngine({
+      config: disabled, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+    });
+    await engine.cycle();
+    assert.equal(sent.length, 0);
+  });
+});
+
+test('a not-ready GPU request notifies the project once while ready pending is silent', async () => {
+  await fixture(async (store) => {
+    const sent = [];
+    const session = {
+      pid: 101, projectId: 'ACL_1', tty: '/dev/ttys018',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'ready' },
+      heartbeat: { historyCursor: 's:1:a', deliveryMarkers: [] },
+    };
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:01:00Z', root: '/queue', invalid: [],
+        counts: { pending: 1, running: 0, done: 0, failed: 0, cancelled: 0 },
+        items: [{
+          runId: 'ACL_1_bad_request', project: 'ACL_1', state: 'pending',
+          remotePath: '/queue/pending/ACL_1_bad_request',
+          submissionReadiness: { state: 'NOT_READY', missing: ['prepared_artifacts'] },
+        }],
+      }),
+    });
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /GPU PREPARATION REQUIRED/);
+    assert.match(sent[0], /prepared_artifacts/);
+  });
+});
+
 test('submitted GPU request wakes one waiting managed scheduler exactly once', async () => {
   await fixture(async (store) => {
     const sessions = new FakeSessions([{
@@ -103,6 +211,54 @@ test('submitted GPU request wakes one waiting managed scheduler exactly once', a
       .find((event) => event.eventType === 'GPU_REQUEST_SUBMITTED').status, 'DELIVERED');
     await engine.cycle({ forceQueue: true });
     assert.equal(sessions.inputs.length, 1);
+  });
+});
+
+test('operational GPU events queue into an already running managed scheduler', async () => {
+  await fixture(async (store) => {
+    const sessions = new FakeSessions([{
+      id: 'scheduler-running', projectId: 'GPU_SCHEDULER', projectName: 'GPU Scheduler',
+      status: 'RUNNING', bootstrapStatus: 'SENT',
+    }]);
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: sessions,
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:01:00Z', root: '/queue', invalid: [],
+        counts: { pending: 1, running: 0, done: 0, failed: 0, cancelled: 0 },
+        items: [{
+          runId: 'ACL_1_running_scheduler', state: 'pending', signal: '.submitted',
+          remotePath: '/queue/pending/ACL_1_running_scheduler',
+        }],
+      }),
+    });
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sessions.inputs.length, 1);
+    assert.match(sessions.inputs[0].data, /ACL_1_running_scheduler/);
+  });
+});
+
+test('persistent GPU Scheduler control is restored even without a new queue event', async () => {
+  await fixture(async (store) => {
+    const sessions = new FakeSessions([]);
+    const base = config();
+    const engine = new AutomationEngine({
+      config: { ...base, controlTargets: [{ id: 'GPU_SCHEDULER' }] },
+      store,
+      sessionManager: sessions,
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:00:00Z', root: '/queue', items: [],
+        invalid: [], counts: { pending: 0, running: 0, done: 0, failed: 0, cancelled: 0 },
+      }),
+      discoverExternalSessions: async () => ({ items: [] }),
+      now: () => new Date('2026-08-11T00:00:00Z'),
+    });
+
+    await engine.cycle({ forceQueue: true });
+    await engine.cycle({ forceQueue: true });
+    assert.deepEqual(sessions.starts, ['GPU_SCHEDULER']);
+    assert.equal(store.listAutomationEvents(20).some((item) => (
+      item.eventType === 'CONTROL_SESSION_RESTORED'
+    )), true);
   });
 });
 
@@ -180,19 +336,20 @@ test('low GPU utilization creates a diagnostic scheduler event but never kills a
   });
 });
 
-test('ready GPU result remains in inbox when no project session is waiting', async () => {
+test('observed GPU transition remains in inbox when no project session is waiting', async () => {
   await fixture(async (store) => {
     const sessions = new FakeSessions([]);
+    let state = 'running';
     const queueCollector = async () => ({
       status: 'ok',
       collectedAt: '2026-08-11T00:01:00Z',
       root: '/queue',
-      counts: { pending: 0, running: 0, done: 1, failed: 0, cancelled: 0 },
+      counts: { pending: 0, running: state === 'running' ? 1 : 0, done: state === 'done' ? 1 : 0, failed: 0, cancelled: 0 },
       invalid: [],
       items: [{
         runId: 'ACL_4_eval_20260811_000000',
         project: 'ACL_4',
-        state: 'done',
+        state,
         signal: '.ready',
         remotePath: '/queue/done/ACL_4_eval_20260811_000000',
       }],
@@ -201,11 +358,72 @@ test('ready GPU result remains in inbox when no project session is waiting', asy
       config: config(), store, sessionManager: sessions, queueCollector,
     });
     await engine.cycle({ forceQueue: true });
+    state = 'done';
+    await engine.cycle({ forceQueue: true });
     const event = store.listAutomationEvents(10)[0];
     assert.equal(event.targetId, 'ACL_4');
     assert.equal(event.status, 'HELD');
     assert.equal(event.note, 'no_waiting_managed_session');
     assert.equal(sessions.starts.length, 0);
+  });
+});
+
+test('cancelled GPU requests stay silent to research sessions', async () => {
+  await fixture(async (store) => {
+    const sent = [];
+    const session = {
+      pid: 112, projectId: 'ACL_1', tty: '/dev/ttys112',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'cancelled' },
+      heartbeat: { historyCursor: 's:1', deliveryMarkers: [] },
+    };
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:01:00Z', root: '/queue', invalid: [],
+        counts: { pending: 0, running: 0, done: 0, failed: 0, cancelled: 1 },
+        items: [{
+          runId: 'ACL_1_cancelled', project: 'ACL_1', state: 'cancelled',
+          remotePath: '/queue/cancelled/ACL_1_cancelled',
+        }],
+      }),
+    });
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 0);
+    assert.equal(store.listAutomationEvents(20).some((item) => (
+      item.targetId === 'ACL_1' && item.eventType === 'GPU_RESULT_READY'
+    )), false);
+  });
+});
+
+test('a historical terminal GPU import cannot replay a project notification', async () => {
+  await fixture(async (store) => {
+    const sent = [];
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [{
+        pid: 113, projectId: 'ACL_1', tty: '/dev/ttys113',
+        terminal: { state: 'WAITING_INPUT', tailHash: 'historical' },
+        heartbeat: { historyCursor: 's:1', deliveryMarkers: [] },
+      }] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      queueCollector: async () => ({
+        status: 'ok', collectedAt: '2026-08-11T00:01:00Z', root: '/queue', invalid: [],
+        counts: { pending: 0, running: 0, done: 1, failed: 0, cancelled: 0 },
+        items: [{
+          runId: 'ACL_1_historical_done', project: 'ACL_1', state: 'done',
+          remotePath: '/queue/done/ACL_1_historical_done',
+        }],
+      }),
+    });
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 0);
+    assert.equal(store.listAutomationEvents(50).some((item) => (
+      item.runId === 'ACL_1_historical_done'
+      && ['GPU_RESULT_READY', 'JOB_RESULT_READY'].includes(item.eventType)
+      && ['PENDING', 'HELD', 'SENT'].includes(item.status)
+    )), false);
   });
 });
 
@@ -619,15 +837,15 @@ test('opt-in Goal Loop continues only at a normal Claude prompt', async () => {
     });
     await engine.cycle({ forceQueue: true });
     assert.equal(sessions.inputs.length, 1);
-    assert.match(sessions.inputs[0].data, /USER-APPROVED GOAL LOOP/);
-    assert.match(sessions.inputs[0].data, /submission-ready paper/);
+    assert.match(sessions.inputs[0].data, /USER-APPROVED CONTINUATION RESPONSE/);
+    assert.doesNotMatch(sessions.inputs[0].data, /submission-ready paper/);
     const event = store.listAutomationEvents(10)
       .find((item) => item.eventType === 'GOAL_CONTINUED');
     assert.equal(event.status, 'DELIVERED');
   });
 });
 
-test('managed Goal Loop accepts a verified active GPU wait from Claude history', async () => {
+test('managed Goal Loop accepts a verified active registered-job wait from Claude history', async () => {
   await fixture(async (store) => {
     store.setAutomationPolicy('ACL_1', {
       enabled: true,
@@ -658,7 +876,7 @@ test('managed Goal Loop accepts a verified active GPU wait from Claude history',
       discoverExternalSessions: async () => ({ items: [{
         pid: 12345,
         projectId: 'ACL_1',
-        heartbeat: { waitingForGpuRunIds: ['ACL_1_train_1'] },
+        heartbeat: { waitingForJobRunIds: ['ACL_1_train_1'] },
       }] }),
       now: () => new Date('2026-08-11T00:02:00Z'),
     });
@@ -705,10 +923,9 @@ test('opt-in Goal Loop safely continues one verified external iTerm session', as
     await engine.cycle({ forceQueue: true });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].session.pid, 12345);
-    assert.match(sent[0].message, /USER-APPROVED GOAL LOOP/);
-    assert.match(sent[0].message, /submission-ready paper/);
-    assert.match(sent[0].message, /sequence of high-value actions/i);
-    assert.match(sent[0].message, /Do not end the turn merely/i);
+    assert.match(sent[0].message, /USER-APPROVED CONTINUATION RESPONSE/);
+    assert.doesNotMatch(sent[0].message, /submission-ready paper/);
+    assert.match(sent[0].message, /Resolve only the ordinary question or option/i);
     assert.equal(store.listAutomationEvents(10)
       .find((item) => item.eventType === 'GOAL_CONTINUED').status, 'SENT');
 
@@ -736,7 +953,130 @@ test('opt-in Goal Loop safely continues one verified external iTerm session', as
     assert.equal(sent.length, 1, 'a new stable wait still observes the grace period');
     now = new Date('2026-08-11T00:00:51Z');
     await engine.cycle({ forceQueue: true });
-    assert.equal(sent.length, 2, 'a proven completed turn bypasses wall-clock cooldown');
+    assert.equal(sent.length, 2, 'a completed assistant turn opens a new autonomous input point');
+    now = new Date('2026-08-11T01:00:12Z');
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 2, 'the same prompt is never injected twice');
+  });
+});
+
+test('an expired provider limit starts a new external continuation epoch', async () => {
+  await fixture(async (store) => {
+    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
+    let now = new Date('2026-08-11T00:00:00Z');
+    const sent = [];
+    const externalSession = {
+      pid: 12345,
+      projectId: 'ACL_1',
+      tty: '/dev/ttys018',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'before-limit' },
+      heartbeat: { historyCursor: 'session.jsonl:10:event-a', deliveryMarkers: [] },
+    };
+    const engine = new AutomationEngine({
+      config: config(),
+      store,
+      sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [externalSession] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      now: () => now,
+    });
+
+    await engine.cycle({ forceQueue: true });
+    now = new Date('2026-08-11T00:00:11Z');
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 1);
+    const marker = sent[0].match(/\[FIRM DELIVERY ([^\]]+)\]/)[1];
+    externalSession.heartbeat = {
+      historyCursor: 'session.jsonl:100:event-b', deliveryMarkers: [marker],
+    };
+    now = new Date('2026-08-11T00:00:22Z');
+    await engine.cycle({ forceQueue: true });
+
+    externalSession.terminal = {
+      state: 'WAITING_INPUT',
+      tailHash: 'after-limit-reset',
+      lastRateLimitResetAt: '2026-08-11T00:10:00Z',
+    };
+    now = new Date('2026-08-11T00:10:01Z');
+    await engine.cycle({ forceQueue: true });
+    now = new Date('2026-08-11T00:10:12Z');
+    await engine.cycle({ forceQueue: true });
+    assert.equal(sent.length, 2, 'pre-reset delivery must not consume post-reset cooldown');
+  });
+});
+
+test('Goal Loop leaves a verified running experiment at a healthy wait', async () => {
+  await fixture(async (store) => {
+    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
+    let now = new Date('2026-08-11T00:00:00Z');
+    const sent = [];
+    const externalSession = {
+      pid: 12345,
+      projectId: 'ACL_1',
+      tty: '/dev/ttys018',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'experiment-wait' },
+      heartbeat: {
+        historyCursor: 'session.jsonl:10:event-a',
+        deliveryMarkers: [],
+        activeToolProcessCount: 1,
+        toolKinds: ['python'],
+      },
+    };
+    const engine = new AutomationEngine({
+      config: config(),
+      store,
+      sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [externalSession] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      now: () => now,
+    });
+
+    await engine.cycle();
+    now = new Date('2026-08-11T02:00:00Z');
+    await engine.cycle();
+    assert.equal(sent.length, 0, 'a live experiment suppresses continuation regardless of elapsed time');
+
+    externalSession.heartbeat.activeToolProcessCount = 0;
+    externalSession.terminal.tailHash = 'experiment-finished';
+    await engine.cycle();
+    now = new Date('2026-08-11T02:00:11Z');
+    await engine.cycle();
+    assert.equal(sent.length, 1, 'normal continuation resumes only after the worker is gone');
+  });
+});
+
+test('Goal Loop never messages a provider rate-limit wait', async () => {
+  await fixture(async (store) => {
+    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
+    let now = new Date('2026-08-11T00:00:00Z');
+    const sent = [];
+    const externalSession = {
+      pid: 12345,
+      projectId: 'ACL_1',
+      tty: '/dev/ttys018',
+      terminal: {
+        state: 'RATE_LIMITED',
+        resetAt: '2026-08-11T05:00:00.000Z',
+        tailHash: 'rate-limit-wait',
+      },
+      heartbeat: { historyCursor: 'session.jsonl:10:event-a', deliveryMarkers: [] },
+    };
+    const engine = new AutomationEngine({
+      config: config(),
+      store,
+      sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [externalSession] }),
+      externalSessionInput: async (_session, message) => sent.push(message),
+      now: () => now,
+    });
+
+    await engine.cycle();
+    now = new Date('2026-08-11T04:59:59Z');
+    await engine.cycle();
+    assert.equal(sent.length, 0);
+    assert.equal(store.listAutomationEvents(100).some((item) => (
+      item.eventType === 'STOP_REVIEW_QUEUED'
+    )), false);
   });
 });
 
@@ -775,7 +1115,7 @@ test('a Codex-cleared external stop bypasses ordinary cooldown but keeps the goa
     }, { verdict: 'PASS' });
     assert.equal(result.status, 'awaiting_history_ack');
     assert.equal(sent.length, 1, 'review clearance should bypass the 60-second test cooldown');
-    assert.match(sent[0].message, /USER-APPROVED GOAL LOOP/);
+    assert.match(sent[0].message, /USER-APPROVED CONTINUATION RESPONSE/);
     let event = store.listAutomationEvents(10)
       .find((item) => item.eventKey.includes('goal:reviewed-stop'));
     assert.equal(event.status, 'SENT');
@@ -942,7 +1282,8 @@ test('a tracked pasted draft gets Enter-only recovery and blocks all duplicate p
     const marker = sent[0].match(/\[FIRM DELIVERY ([^\]]+)\]/)[1];
 
     session.terminal = {
-      state: 'DRAFT_PENDING_ENTER', tailHash: 'draft-a', draftDeliveryMarker: marker,
+      state: 'DRAFT_PENDING_ENTER', tailHash: 'draft-a',
+      draftDeliveryMarker: null, collapsedPasteDraft: true,
     };
     now = new Date('2026-08-11T00:00:03Z');
     const manual = await engine.continueExternalSession(session, 'do not duplicate');
@@ -958,6 +1299,85 @@ test('a tracked pasted draft gets Enter-only recovery and blocks all duplicate p
     await engine.cycle({ forceQueue: true });
     assert.equal(store.getOutboxMessage(marker).status, 'ACKED');
     assert.equal(store.getAutomationEvent('gpu:ACL_1_enter_recovery:done').status, 'DELIVERED');
+  });
+});
+
+test('an acknowledged marker still visible in the editor is cleared, never resubmitted', async () => {
+  await fixture(async (store) => {
+    const event = store.createAutomationEvent({
+      eventKey: 'gpu:ACL_1_already_acked:done', category: 'gpu_queue',
+      eventType: 'GPU_RESULT_READY', targetId: 'ACL_1', severity: 'info',
+      title: 'Done', message: 'Read it.', source: {},
+    });
+    let message = store.createOutboxMessage({
+      messageKey: 'firm-already-acked', targetId: 'ACL_1', category: 'gpu_queue',
+      automationEventId: event.id, sessionPid: 108, tty: '/dev/ttys108',
+      payloadText: '[FIRM DELIVERY firm-already-acked]\nread it',
+      payloadHash: 'c'.repeat(64), baselineCursor: 's:0',
+    });
+    store.claimOutboxMessage(message.id, '2026-08-11T00:00:00Z');
+    store.markOutboxSent(message.id, '2026-08-11T00:00:01Z');
+    store.acknowledgeOutboxMessage(message.id, { at: '2026-08-11T00:00:02Z', cursor: 's:1' });
+    const cleared = [];
+    const submitted = [];
+    const session = {
+      pid: 108, projectId: 'ACL_1', tty: '/dev/ttys108',
+      terminal: {
+        state: 'DRAFT_PENDING_ENTER', tailHash: 'duplicate-draft',
+        draftDeliveryMarker: 'firm-already-acked',
+      },
+      heartbeat: { historyCursor: 's:1', deliveryMarkers: ['firm-already-acked'] },
+    };
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionSubmit: async () => submitted.push('enter'),
+      externalSessionClear: async (target) => cleared.push(target.tty),
+    });
+    await engine.cycle();
+    assert.deepEqual(cleared, ['/dev/ttys108']);
+    assert.deepEqual(submitted, []);
+    const eventKey = 'interaction:ACL_1:108:acked-draft:firm-already-acked';
+    assert.equal(store.getAutomationEvent(eventKey).eventType, 'ACKED_DELIVERY_DRAFT_CLEARED');
+    session.terminal = {
+      ...session.terminal, tailHash: 'render-only-change',
+    };
+    await engine.cycle();
+    assert.equal(store.getAutomationEvent(eventKey).status, 'SENT',
+      'render changes do not prove that the marker left the editor');
+    session.terminal = { state: 'WAITING_INPUT', tailHash: 'blank-after-clear' };
+    await engine.cycle();
+    assert.equal(store.getAutomationEvent(eventKey).status, 'RESOLVED');
+  });
+});
+
+test('Claude routine recommendation is confirmed once and verified by foreground advance', async () => {
+  await fixture(async (store) => {
+    const submitted = [];
+    const session = {
+      pid: 109, projectId: 'ACL_1', tty: '/dev/ttys109',
+      terminal: {
+        state: 'ROUTINE_CHOICE', tailHash: 'choice-a', recommendedSelected: true,
+        selectedOptionNumber: 1, selectedOptionText: 'Run the queued baseline.',
+      },
+      heartbeat: { historyCursor: 's:1', deliveryMarkers: [] },
+    };
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionSubmit: async (target) => submitted.push(target.tty),
+    });
+    await engine.cycle();
+    await engine.cycle();
+    assert.deepEqual(submitted, ['/dev/ttys109']);
+    const event = store.listAutomationEvents(100).find((item) => (
+      item.eventType === 'ROUTINE_RECOMMENDATION_ACCEPTED'
+    ));
+    assert.equal(event.status, 'SENT');
+    session.terminal = { state: 'WORKING', tailHash: 'work-b' };
+    session.heartbeat = { historyCursor: 's:2', deliveryMarkers: [] };
+    await engine.cycle();
+    assert.equal(store.getAutomationEvent(event.eventKey).status, 'RESOLVED');
   });
 });
 
@@ -990,7 +1410,7 @@ test('manual continuation is rejected while the same project has an unacknowledg
   });
 });
 
-test('an ACK without assistant progress gets one bounded recovery and then hard-stops', async () => {
+test('an ACK without assistant progress holds retries until real progress appears', async () => {
   await fixture(async (store) => {
     store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
     let now = new Date('2026-08-11T00:00:00Z');
@@ -1027,25 +1447,68 @@ test('an ACK without assistant progress gets one bounded recovery and then hard-
     )).length, 1);
     now = new Date('2026-08-11T00:01:23Z');
     await engine.cycle();
-    assert.equal(sent.length, 2, 'exactly one recovery continuation is allowed');
-
-    const secondMarker = sent[1].match(/\[FIRM DELIVERY ([^\]]+)\]/)[1];
-    session.heartbeat = {
-      historyCursor: 's:2', deliveryMarkers: [firstMarker, secondMarker], latestAssistantAt: null,
-    };
-    session.terminal = { state: 'WAITING_INPUT', tailHash: 'wait-2' };
-    now = new Date('2026-08-11T00:02:24Z');
+    assert.equal(sent.length, 1, 'no recovery prompt is injected without assistant progress');
+    now = new Date('2026-08-11T02:02:24Z');
     await engine.cycle();
-    assert.equal(sent.length, 2);
+    assert.equal(sent.length, 1, 'elapsed cooldown alone cannot authorize a retry');
     const stalls = store.listAutomationEvents(100).filter((item) => (
       item.eventType === 'SESSION_ACCEPTED_INPUT_STALLED'
     ));
-    assert.equal(stalls.length, 2);
-    assert.equal(stalls.some((item) => item.severity === 'error'), true);
+    assert.equal(stalls.length, 1);
+    assert.equal(stalls[0].severity, 'warn');
   });
 });
 
-test('a verified GPU wait suppresses stop review and Goal Loop until the result is terminal', async () => {
+test('durable assistant and progress evidence resolves stale watchdog events after restart', async () => {
+  await fixture(async (store) => {
+    const delivery = store.createAutomationEvent({
+      eventKey: 'goal:durable-progress', category: 'goal_loop', eventType: 'GOAL_CONTINUED',
+      targetId: 'ACL_1', severity: 'info', title: 'Continue', message: 'Continue', source: {},
+    });
+    let message = store.createOutboxMessage({
+      messageKey: 'firm-durable', targetId: 'ACL_1', category: 'goal_loop',
+      automationEventId: delivery.id, sessionPid: 110, tty: '/dev/ttys110',
+      payloadText: '[FIRM DELIVERY firm-durable]\ncontinue', payloadHash: 'd'.repeat(64),
+      baselineCursor: 's:0',
+    });
+    store.claimOutboxMessage(message.id, '2026-08-11T00:00:00Z');
+    store.markOutboxSent(message.id, '2026-08-11T00:00:01Z');
+    store.createAutomationEvent({
+      eventKey: 'delivery:firm-durable:accepted_input_stalled',
+      category: 'session_watchdog', eventType: 'SESSION_ACCEPTED_INPUT_STALLED',
+      targetId: 'ACL_1', severity: 'warn', title: 'Stalled', message: 'Stalled',
+      source: { messageKey: 'firm-durable' },
+    });
+    store.createAutomationEvent({
+      eventKey: 'session:ACL_1:110:progress_stall:old',
+      category: 'session_watchdog', eventType: 'SESSION_PROGRESS_STALLED',
+      targetId: 'ACL_1', severity: 'warn', title: 'Stalled', message: 'Stalled',
+      source: { lastProgressAt: '2026-08-11T00:00:00Z' },
+    });
+    const session = {
+      pid: 110, projectId: 'ACL_1', tty: '/dev/ttys110',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'new-wait' },
+      heartbeat: {
+        historyCursor: 's:2', latestAssistantAt: '2026-08-11T00:00:03Z',
+        lastProgressAt: '2026-08-11T00:00:03Z', deliveryMarkers: ['firm-durable'],
+      },
+    };
+    const engine = new AutomationEngine({
+      config: config(), store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      now: () => new Date('2026-08-11T00:00:04Z'),
+    });
+    await engine.cycle();
+    assert.equal(store.getAutomationEvent(
+      'delivery:firm-durable:accepted_input_stalled',
+    ).status, 'RESOLVED');
+    assert.equal(store.getAutomationEvent(
+      'session:ACL_1:110:progress_stall:old',
+    ).status, 'RESOLVED');
+  });
+});
+
+test('a verified registered-job wait suppresses stop review and Goal Loop until terminal', async () => {
   await fixture(async (store) => {
     store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
     let now = new Date('2026-08-11T00:00:00Z');
@@ -1057,7 +1520,7 @@ test('a verified GPU wait suppresses stop review and Goal Loop until the result 
       terminal: { state: 'WAITING_INPUT', tailHash: 'gpu-wait-tail' },
       heartbeat: {
         historyCursor: 's:gpu-wait', deliveryMarkers: [],
-        waitingForGpuRunIds: ['ACL_1_train_1'],
+        waitingForJobRunIds: ['ACL_1_train_1'],
       },
     };
     const queueCollector = async () => ({
@@ -1086,13 +1549,13 @@ test('a verified GPU wait suppresses stop review and Goal Loop until the result 
     assert.equal(sent.length, 0);
     assert.equal(stopped.length, 0);
     assert.equal(store.listAutomationEvents(100).some((item) => (
-      item.eventType === 'GPU_WAIT_ACCEPTED'
+      item.eventType === 'JOB_WAIT_ACCEPTED'
     )), true);
 
     queueState = 'done';
     now = new Date('2026-08-11T00:00:21Z');
     await engine.cycle({ forceQueue: true });
     assert.equal(sent.length, 1, 'terminal GPU result should wake the waiting project');
-    assert.match(sent[0], /GPU RESULT/);
+    assert.match(sent[0], /REGISTERED JOB RESULT/);
   });
 });

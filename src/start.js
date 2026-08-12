@@ -49,6 +49,21 @@ async function main() {
   } catch (error) {
     console.error('Initial automation cycle failed:', error);
   }
+  let brokerFailures = 0;
+  const brokerWatch = setInterval(async () => {
+    try {
+      await client.health();
+      brokerFailures = 0;
+    } catch (error) {
+      brokerFailures += 1;
+      console.error(`Broker health check failed (${brokerFailures}/3):`, error);
+      if (brokerFailures >= 3) {
+        console.error('Broker remained unavailable; exiting so the supervisor can rebuild the control plane.');
+        process.exit(1);
+      }
+    }
+  }, 15_000);
+  brokerWatch.unref();
 }
 
 main().catch((error) => {

@@ -52,6 +52,10 @@ export async function loadConfig() {
         || project.sessionPathAliases.some((path) => typeof path !== 'string' || !path)) {
       throw new Error(`Invalid sessionPathAliases configuration: ${project.id}`);
     }
+    if (project.bootstrapFile
+        && !['prompt.txt', 'START_PROMPT.md'].includes(project.bootstrapFile)) {
+      throw new Error(`Invalid bootstrapFile configuration: ${project.id}`);
+    }
     ids.add(project.id);
   }
   if (!projects.length) throw new Error('Configuration must contain at least one project');
@@ -100,6 +104,13 @@ export async function loadConfig() {
   const gpuQueueEnabled = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_GPU_QUEUE_ENABLED ?? 'false'),
   );
+  const gpuQueueDockerContainer = String(
+    process.env.FIRM_GPU_QUEUE_DOCKER_CONTAINER || '',
+  ).trim();
+  if (gpuQueueDockerContainer
+      && !/^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(gpuQueueDockerContainer)) {
+    throw new Error('FIRM_GPU_QUEUE_DOCKER_CONTAINER must be a Docker name or id');
+  }
   const gpuSchedulerAutoStart = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_GPU_SCHEDULER_AUTO_START ?? 'false'),
   );
@@ -113,11 +124,15 @@ export async function loadConfig() {
     process.env.FIRM_TOOL_PROGRESS_STALL_MS ?? 30 * 60 * 1000,
   );
   const stopReviewStableMs = Number(process.env.FIRM_STOP_REVIEW_STABLE_MS ?? 15 * 1000);
+  const goalLoopEnabled = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_GOAL_LOOP_ENABLED ?? 'false'),
+  );
   const goalContinueGraceMs = Number(process.env.FIRM_GOAL_CONTINUE_GRACE_MS ?? 15 * 1000);
   const goalContinueCooldownMs = Number(
     process.env.FIRM_GOAL_CONTINUE_COOLDOWN_MS ?? 30 * 60 * 1000,
   );
   const goalMaxContinuesPerDay = Number(process.env.FIRM_GOAL_MAX_CONTINUES_PER_DAY ?? 48);
+  const goalBudgetEpoch = String(process.env.FIRM_GOAL_BUDGET_EPOCH || '').trim() || null;
   for (const [name, value, minimum] of [
     ['FIRM_GPU_QUEUE_POLL_MS', gpuQueuePollMs, 1000],
     ['FIRM_GPU_QUEUE_TIMEOUT_MS', gpuQueueTimeoutMs, 1000],
@@ -139,6 +154,9 @@ export async function loadConfig() {
       || goalMaxContinuesPerDay > 100) {
     throw new Error('FIRM_GOAL_MAX_CONTINUES_PER_DAY must be an integer from 1 to 100');
   }
+  if (goalBudgetEpoch && !Number.isFinite(Date.parse(goalBudgetEpoch))) {
+    throw new Error('FIRM_GOAL_BUDGET_EPOCH must be an ISO-8601 timestamp');
+  }
   const defaultControlPaths = [...new Set(projects.map((project) => dirname(project.path)))];
   const controlSessionPaths = String(process.env.FIRM_CONTROL_SESSION_PATHS || '')
     .split(':')
@@ -146,13 +164,21 @@ export async function loadConfig() {
     .map((path) => resolve(expand(path)));
   const resolvedControlPaths = controlSessionPaths.length ? controlSessionPaths : defaultControlPaths;
   const claudeArgs = ['--append-system-prompt-file', 'CLAUDE-RESEARCH.md'];
+  const gpuSchedulerArgs = [
+    '--effort',
+    'low',
+    '--dangerously-skip-permissions',
+    '--disable-slash-commands',
+    '--disallowedTools',
+    'WebSearch,WebFetch,Edit,Write,NotebookEdit,Agent',
+  ];
   const controlTargets = gpuQueueEnabled && resolvedControlPaths.length ? [
     {
       id: 'GPU_SCHEDULER',
       name: 'GPU Scheduler',
       kind: 'control',
       path: resolvedControlPaths[0],
-      args: [],
+      args: gpuSchedulerArgs,
       bootstrapFile: 'GPU_SCHEDULER_START_PROMPT.md',
       bootstrapRequiredFiles: [
         'CLAUDE.md',
@@ -168,8 +194,11 @@ export async function loadConfig() {
       ...project,
       kind: 'research',
       args: claudeArgs,
-      bootstrapFile: 'prompt.txt',
-      bootstrapRequiredFiles: ['CLAUDE-RESEARCH.md', 'prompt.txt'],
+      bootstrapFile: project.bootstrapFile || 'prompt.txt',
+      bootstrapRequiredFiles: [
+        'CLAUDE-RESEARCH.md',
+        project.bootstrapFile || 'prompt.txt',
+      ],
     })),
     ...controlTargets,
   ];
@@ -199,6 +228,7 @@ export async function loadConfig() {
       host: process.env.FIRM_GPU_QUEUE_HOST || '',
       port: Number(process.env.FIRM_GPU_QUEUE_SSH_PORT || 22),
       root: process.env.FIRM_GPU_QUEUE_ROOT || '',
+      dockerContainer: gpuQueueDockerContainer || null,
       pollMs: gpuQueuePollMs,
       timeoutMs: gpuQueueTimeoutMs,
       schedulerAutoStart: gpuSchedulerAutoStart,
@@ -217,9 +247,11 @@ export async function loadConfig() {
       stopReviewStableMs,
     },
     goalLoop: {
+      enabled: goalLoopEnabled,
       graceMs: goalContinueGraceMs,
       cooldownMs: goalContinueCooldownMs,
       maxContinuesPerDay: goalMaxContinuesPerDay,
+      budgetEpoch: goalBudgetEpoch,
       enterRetryMs: 2_000,
       postAckStallMs: 60_000,
     },

@@ -82,6 +82,39 @@ test('collector reads only the allowlisted files and retains SHA-256 evidence', 
   }
 });
 
+test('collector uses the configured project bootstrap as prompt evidence', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-bootstrap-evidence-'));
+  try {
+    const contents = {
+      'PROJECT_IDENTITY.json': JSON.stringify({ current: { status: 'user_approved' } }),
+      'PROGRAM_ORIGIN.md': '# origin\n',
+      'SEED.md': '# seed\n',
+      'PIPELINE_STATE.md': '# state\n',
+      'CLAUDE.md': '# policy\n',
+      'START_PROMPT.md': 'start from sealed origin\n',
+    };
+    await Promise.all(Object.entries(contents)
+      .map(([name, content]) => writeFile(join(root, name), content)));
+    const snapshot = await collectSnapshot([{
+      id: 'ACL_1',
+      name: 'ACL_1',
+      path: root,
+      bootstrapFile: 'START_PROMPT.md',
+      sessionPathAliases: [],
+      expected: {},
+    }], new Date(), {
+      collectTmux: async () => ({ status: 'degraded', available: false, reason: 'test', panes: [] }),
+      runCommand: async () => ({ ok: true, stdout: '', stderr: '' }),
+    });
+    const prompt = snapshot.projects[0].files.find((file) => file.name === 'prompt.txt');
+    assert.equal(prompt.status, 'ok');
+    assert.equal(prompt.sourceName, 'START_PROMPT.md');
+    assert.equal(prompt.content, 'start from sealed origin\n');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('collector merges modern identity fields with the sealed program authority', async () => {
   const root = await mkdtemp(join(tmpdir(), 'firm-modern-identity-'));
   await writeFile(join(root, 'PROJECT_IDENTITY.json'), JSON.stringify({
@@ -168,14 +201,49 @@ test('liveness collector combines history, project writes, and non-infrastructur
       historyHeartbeatReader: async () => ({
         status: 'ok', latestWriteAt: '2026-08-11T00:02:00.000Z', sourceFile: 'live.jsonl',
         latestAssistantAt: '2026-08-11T00:01:59.000Z',
+        latestAssistantText: 'Should I run the matched comparison next?',
+        constructionLease: { id: 'method-v1', state: 'active', active: true },
       }),
     });
     assert.equal(result.items.length, 1);
     assert.equal(result.items[0].heartbeat.historyWriteAt, '2026-08-11T00:02:00.000Z');
     assert.equal(result.items[0].heartbeat.latestAssistantAt, '2026-08-11T00:01:59.000Z');
+    assert.equal(result.items[0].heartbeat.latestAssistantText,
+      'Should I run the matched comparison next?');
+    assert.equal(result.items[0].heartbeat.constructionLease.id, 'method-v1');
     assert.equal(result.items[0].heartbeat.toolProcessCount, 1);
     assert.equal(result.items[0].heartbeat.activeToolProcessCount, 1);
     assert.deepEqual(result.items[0].heartbeat.toolKinds, ['python']);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('a sleeping ssh descendant remains an active remote tool dependency', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-remote-tool-collector-'));
+  const projectPath = join(root, 'ICASSP_6');
+  await mkdir(projectPath);
+  await writeFile(join(projectPath, 'PIPELINE_STATE.md'), '# live\n');
+  const ps = [
+    '100 1 ttys002 00:20 0.2 S+ /usr/local/bin/claude --continue',
+    '110 100 ?? 00:05 0.0 Ss /bin/zsh -c ssh host sleep 480',
+    '111 110 ?? 00:05 0.0 S /usr/bin/ssh host sleep 480',
+    '112 100 ?? 00:20 0.0 S /usr/bin/python -m glm_mcp_clone.server --service web-reader',
+  ].join('\n');
+  try {
+    const result = await collectClaudeSessions([
+      { id: 'ICASSP_6', path: projectPath, sessionPathAliases: [] },
+    ], {
+      platform: 'linux',
+      collectLiveness: true,
+      claudeProjectsDir: join(root, 'history'),
+      runCommand: async () => ({ ok: true, stdout: ps, stderr: '' }),
+      readlinkFn: async () => projectPath,
+      historyHeartbeatReader: async () => ({ status: 'ok' }),
+    });
+    assert.equal(result.items[0].heartbeat.toolProcessCount, 2);
+    assert.equal(result.items[0].heartbeat.activeToolProcessCount, 2);
+    assert.deepEqual(result.items[0].heartbeat.toolKinds.sort(), ['ssh', 'zsh']);
   } finally {
     await rm(root, { recursive: true, force: true });
   }
