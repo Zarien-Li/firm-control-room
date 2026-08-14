@@ -36,7 +36,22 @@ sed "s|__HOME__|$HOME|g" "$SOURCE" > "$TARGET"
 chmod 600 "$TARGET"
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
-launchctl bootstrap "$DOMAIN" "$TARGET"
+for _ in {1..10}; do
+  if ! launchctl print "$DOMAIN/$LABEL" >/dev/null 2>&1; then
+    break
+  fi
+  sleep 1
+done
+for attempt in 1 2 3; do
+  if launchctl bootstrap "$DOMAIN" "$TARGET"; then
+    break
+  fi
+  if [[ "$attempt" == 3 ]]; then
+    echo "Failed to bootstrap $DOMAIN/$LABEL after $attempt attempts" >&2
+    exit 1
+  fi
+  sleep 1
+done
 launchctl enable "$DOMAIN/$LABEL"
 launchctl kickstart -k "$DOMAIN/$LABEL"
 

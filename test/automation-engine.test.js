@@ -185,6 +185,85 @@ test('AI session resolver can keep a stopped episode silent without a hard-coded
   });
 });
 
+test('failed AI resolution retries the same stopped episode after backoff', async () => {
+  await fixture(async (store) => {
+    const localConfig = config();
+    localConfig.watchdog.stopReviewStableMs = 0;
+    let now = new Date('2026-08-11T00:00:00Z');
+    let calls = 0;
+    const session = {
+      pid: 119, projectId: 'ACL_1', tty: '/dev/ttys119',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'provider-limit' },
+      heartbeat: {
+        historyCursor: 's:limit', episodeId: 'episode-limit', deliveryMarkers: [],
+        latestAssistantText: 'API Error: provider limit reached.',
+      },
+    };
+    const engine = new AutomationEngine({
+      config: localConfig, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      operationalResolver: async () => {
+        calls += 1;
+        if (calls === 1) return { status: 'failed', error: 'provider unavailable' };
+        return {
+          status: 'completed', resolution: {
+            shouldSend: false, message: '', confidence: 0.99,
+            evidenceSource: 'session:latest-assistant', evidenceQuote: 'provider limit reached',
+            rationale: 'No message is needed now.', recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
+      now: () => now,
+    });
+    await engine.cycle();
+    assert.equal(calls, 1);
+    now = new Date('2026-08-11T00:00:30Z');
+    await engine.cycle();
+    assert.equal(calls, 1);
+    now = new Date('2026-08-11T00:01:01Z');
+    await engine.cycle();
+    assert.equal(calls, 2);
+  });
+});
+
+test('AI resolutions for distinct stopped sessions run concurrently', async () => {
+  await fixture(async (store) => {
+    const localConfig = config();
+    localConfig.watchdog.stopReviewStableMs = 0;
+    const sessions = ['ACL_1', 'ACL_4'].map((projectId, index) => ({
+      pid: 130 + index, projectId, tty: `/dev/ttys${130 + index}`,
+      terminal: { state: 'WAITING_INPUT', tailHash: `stop-${index}` },
+      heartbeat: {
+        historyCursor: `s:${index}`, episodeId: `episode-${index}`,
+        latestAssistantText: `Stopped session ${index}`,
+      },
+    }));
+    let active = 0;
+    let peak = 0;
+    const engine = new AutomationEngine({
+      config: localConfig, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: sessions }),
+      operationalResolver: async () => {
+        active += 1;
+        peak = Math.max(peak, active);
+        await new Promise((resolve) => setTimeout(resolve, 10));
+        active -= 1;
+        return {
+          status: 'completed', resolution: {
+            shouldSend: false, message: '', confidence: 0.99,
+            evidenceSource: 'session:latest-assistant', evidenceQuote: 'Stopped session',
+            rationale: 'Remain silent.', recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
+    });
+    await engine.cycle();
+    assert.equal(peak, 2);
+  });
+});
+
 test('AI response is discarded when Claude advances while Codex is deciding', async () => {
   await fixture(async (store) => {
     const localConfig = config();

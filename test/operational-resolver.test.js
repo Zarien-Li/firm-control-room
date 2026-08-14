@@ -54,3 +54,23 @@ test('session resolver rejects ungrounded intervention text', () => {
   }, packet);
   assert.equal(result.grounding.eligible, false);
 });
+
+test('session resolver survives terminal wrapping when history contains the exact quote', () => {
+  const packet = {
+    evidence: [
+      { id: 'terminal:current-episode', text: 'API Error: 529 [abc\n123]. Try again.' },
+      { id: 'session:latest-assistant', text: 'API Error: 529 [abc123]. Try again.' },
+    ],
+  };
+  const result = groundOperationalResolution({
+    send: true,
+    message: 'Resume the interrupted action.',
+    confidence: 0.99,
+    evidence_source: 'terminal:current-episode',
+    evidence_quote: 'API Error: 529 [abc123]. Try again.',
+    rationale: 'The terminal wrapped a token but history retained it.',
+    recheck_after_seconds: 60,
+  }, packet);
+  assert.equal(result.grounding.eligible, true);
+  assert.equal(result.evidenceSource, 'session:latest-assistant');
+});

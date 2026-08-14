@@ -60,16 +60,23 @@ export function groundOperationalResolution(value, packet) {
       || typeof value.rationale !== 'string' || !Number.isSafeInteger(value.recheck_after_seconds)) {
     throw new Error('Codex returned an invalid operational resolution shape');
   }
-  const source = packet.evidence.find((item) => item.id === value.evidence_source);
-  const grounded = Boolean(source)
-    && normalize(value.evidence_quote).length >= 8
-    && normalize(source.text).includes(normalize(value.evidence_quote));
+  const quote = normalize(value.evidence_quote);
+  const claimedSource = packet.evidence.find((item) => item.id === value.evidence_source);
+  // Terminal wrapping can split a token while the same Claude event remains intact
+  // in history. Ground against the complete packet, preferring the claimed source.
+  const sources = claimedSource
+    ? [claimedSource, ...packet.evidence.filter((item) => item !== claimedSource)]
+    : packet.evidence;
+  const source = quote.length >= 8
+    ? sources.find((item) => normalize(item.text).includes(quote))
+    : null;
+  const grounded = Boolean(source);
   return {
     schemaVersion: 1,
     shouldSend: value.send,
     message: value.send ? value.message.trim() : '',
     confidence: Math.max(0, Math.min(1, value.confidence)),
-    evidenceSource: value.evidence_source,
+    evidenceSource: source?.id || value.evidence_source,
     evidenceQuote: value.evidence_quote.trim(),
     rationale: value.rationale.trim(),
     recheckAfterSeconds: Math.max(0, Math.min(86400, value.recheck_after_seconds)),

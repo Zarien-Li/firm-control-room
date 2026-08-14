@@ -346,6 +346,7 @@ export class AutomationEngine {
       }
     }
     const seen = new Set();
+    const stoppedResolutions = [];
     for (const session of external.items || []) {
       if (!session.projectId || !this.projectIds.has(session.projectId)) continue;
       const key = `${session.projectId}:${session.pid}`;
@@ -551,9 +552,7 @@ export class AutomationEngine {
       const stableMs = this.config.watchdog.stopReviewStableMs ?? 15 * 1000;
       if (this.now().getTime() - candidate.firstSeenAt < stableMs) continue;
       if (typeof this.operationalResolver === 'function') {
-        const outcome = await this.#resolveStoppedSession(session, candidate);
-        candidate.dispatched = outcome.done;
-        candidate.deferUntil = outcome.deferUntil || null;
+        stoppedResolutions.push({ session, candidate });
       } else {
         candidate.dispatched = true;
         if (typeof this.onExternalSessionStopped === 'function') {
@@ -561,6 +560,11 @@ export class AutomationEngine {
         }
       }
     }
+    await Promise.all(stoppedResolutions.map(async ({ session, candidate }) => {
+      const outcome = await this.#resolveStoppedSession(session, candidate);
+      candidate.dispatched = outcome.done;
+      candidate.deferUntil = outcome.deferUntil || null;
+    }));
     for (const key of this.externalTerminalStates.keys()) {
       if (!seen.has(key)) {
         this.externalTerminalStates.delete(key);
@@ -601,6 +605,15 @@ export class AutomationEngine {
         source: { deliveryPolicy: 'none', pid: session.pid, resolverStatus: result?.status || 'unknown' },
         note: String(result?.error || 'ungrounded_operational_resolution').slice(0, 500),
       });
+      const requestedRetrySeconds = Number(resolution?.recheckAfterSeconds || 0);
+      if (result?.status !== 'completed' || requestedRetrySeconds > 0) {
+        candidate.operationalResult = null;
+        candidate.resolverAttempts = Number(candidate.resolverAttempts || 0) + 1;
+        const retryMs = requestedRetrySeconds > 0
+          ? requestedRetrySeconds * 1000
+          : Math.min(15 * 60_000, 60_000 * (2 ** Math.min(candidate.resolverAttempts - 1, 4)));
+        return { done: false, deferUntil: this.now().getTime() + retryMs };
+      }
       return { done: true };
     }
     this.store.createAutomationEvent({
