@@ -5,6 +5,9 @@ import { jobWaitStatus } from './job-wait.js';
 import { probeSchedulerMonitor } from './scheduler-monitor.js';
 
 const ACTIVE_SESSION_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'WAITING_INPUT']);
+const AI_INPUT_STATES = new Set([
+  'WAITING_INPUT', 'ROUTINE_CHOICE', 'BOUNDARY_CHOICE', 'INTERACTIVE_CONFIRMATION',
+]);
 const TERMINAL_QUEUE_STATES = new Set(['done', 'failed', 'cancelled']);
 
 function eventSeverity(state) {
@@ -101,34 +104,6 @@ function goalPrompt(policy) {
   ].join('\n');
 }
 
-function selfResolveChoicePrompt() {
-  return [
-    '[FIRM USER-APPROVED ROUTINE-CHOICE RESPONSE]',
-    'Your immediately preceding menu contains ordinary research or engineering alternatives, not a human-owned permission decision.',
-    'Using the evidence already in this session, choose the highest-value option yourself and execute it now. Do not return the same menu or ask the user to ratify a routine choice.',
-    'Do not reinterpret the paper identity, broaden scope, grant permissions, perform irreversible operations, or authorize exceptional resources through this response.',
-  ].join('\n');
-}
-
-function selfResolveQuestionPrompt() {
-  return [
-    '[FIRM USER-APPROVED ROUTINE-QUESTION RESPONSE]',
-    'Answer the ordinary research or engineering question in your immediately preceding message from evidence already in this session, choose the highest-value action, and execute it.',
-    'Stay inside any active construction episode. Do not begin a new method, call Codex, restate the project objective, or ask the user to ratify a routine decision because of this response.',
-    'If the question actually requires permission, an irreversible action, exceptional resources, or a user-owned change of scope or contribution type, state only that concrete boundary and wait.',
-  ].join('\n');
-}
-
-function routineQuestion(text) {
-  const value = String(text || '')
-    .replace(/\[FIRM (?:WAITING_FOR_JOB|CONSTRUCTION_LEASE)[^\]]*\]/g, '')
-    .trim();
-  if (!value || !/(?:[?？]\s*$|(?:请|需要|等待)(?:你|您)(?:决定|选择|确认)[。.!！]?\s*$)/u.test(value)) {
-    return false;
-  }
-  return !/(?:permission|authorize|approval|approve|delete|archive|withdraw|submit|purchase|paper identity|contribution type|new seed|venue change|权限|授权|批准|许可|删除|归档|投稿|撤稿|付费|更换\s*seed|贡献类型|论文身份|更换会议)/i.test(value.slice(-1200));
-}
-
 function acceptsExternalOperationalInput(session) {
   return session.terminal?.state === 'WAITING_INPUT'
     || (session.terminal?.state === 'WORKING' && session.terminal?.acceptsQueuedInput === true);
@@ -167,6 +142,7 @@ export class AutomationEngine {
     externalSessionSubmit = null,
     externalSessionClear = null,
     externalSessionDismissChoice = null,
+    operationalResolver = null,
     onExternalSessionStopped = null,
     schedulerMonitorProbe = probeSchedulerMonitor,
     jobRegistry = null,
@@ -181,6 +157,7 @@ export class AutomationEngine {
     this.externalSessionSubmit = externalSessionSubmit;
     this.externalSessionClear = externalSessionClear;
     this.externalSessionDismissChoice = externalSessionDismissChoice;
+    this.operationalResolver = operationalResolver;
     this.onExternalSessionStopped = onExternalSessionStopped;
     this.schedulerMonitorProbe = schedulerMonitorProbe;
     this.jobRegistry = jobRegistry || new JobRegistry({ store, now });
@@ -536,33 +513,7 @@ export class AutomationEngine {
         }
         this.externalProgressCandidates.delete(key);
       }
-      const jobWait = jobWaitStatus(session, this.jobsSnapshot());
-      if (current === 'WAITING_INPUT' && jobWait.waiting) {
-        this.externalStopCandidates.delete(key);
-        this.externalWaitingSince.delete(key);
-        this.store.createAutomationEvent({
-          eventKey: `job-wait:${session.projectId}:${jobWait.matchedRunIds.sort().join(',')}`,
-          category: 'session_watchdog', eventType: 'JOB_WAIT_ACCEPTED',
-          targetId: session.projectId, severity: 'info', status: 'RESOLVED',
-          title: `Legitimate registered-job wait: ${session.projectId}`,
-          message: `The project explicitly declared a wait on active registered job(s): ${jobWait.matchedRunIds.join(', ')}.`,
-          source: {
-            deliveryPolicy: 'none', pid: session.pid,
-            runIds: jobWait.matchedRunIds,
-          },
-          note: 'goal_and_stop_review_suppressed_until_gpu_terminal_state',
-        });
-        for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
-          candidate.targetId === session.projectId
-          && candidate.eventType === 'STOP_REVIEW_QUEUED'
-        ))) {
-          this.store.setAutomationEvent(event.id, {
-            status: 'RESOLVED', note: 'superseded_by_verified_gpu_wait',
-          });
-        }
-        continue;
-      }
-      if (current !== 'WAITING_INPUT') {
+      if (!AI_INPUT_STATES.has(current)) {
         this.externalStopCandidates.delete(key);
         continue;
       }
@@ -575,7 +526,7 @@ export class AutomationEngine {
         existingStop?.waitingEvidenceAt && waitingEvidenceAt
         && existingStop.waitingEvidenceAt !== waitingEvidenceAt,
       );
-      const distinctWaitingEpisode = previous !== 'WAITING_INPUT'
+      const distinctWaitingEpisode = !AI_INPUT_STATES.has(previous)
         || !existingStop
         || (existingStop.stop.tailHash !== tailHash && evidenceAdvanced);
       if (distinctWaitingEpisode) {
@@ -596,11 +547,18 @@ export class AutomationEngine {
       }
       const candidate = this.externalStopCandidates.get(key);
       if (!candidate || candidate.dispatched) continue;
+      if (candidate.deferUntil && this.now().getTime() < candidate.deferUntil) continue;
       const stableMs = this.config.watchdog.stopReviewStableMs ?? 15 * 1000;
       if (this.now().getTime() - candidate.firstSeenAt < stableMs) continue;
-      candidate.dispatched = true;
-      if (typeof this.onExternalSessionStopped === 'function') {
-        await this.onExternalSessionStopped(candidate.stop);
+      if (typeof this.operationalResolver === 'function') {
+        const outcome = await this.#resolveStoppedSession(session, candidate);
+        candidate.dispatched = outcome.done;
+        candidate.deferUntil = outcome.deferUntil || null;
+      } else {
+        candidate.dispatched = true;
+        if (typeof this.onExternalSessionStopped === 'function') {
+          await this.onExternalSessionStopped(candidate.stop);
+        }
       }
     }
     for (const key of this.externalTerminalStates.keys()) {
@@ -617,6 +575,141 @@ export class AutomationEngine {
     }
   }
 
+  async #resolveStoppedSession(session, candidate) {
+    const project = this.config.projects.find((item) => item.id === session.projectId);
+    if (!project) return { done: true };
+    if (!candidate.operationalResult) {
+      try {
+        candidate.operationalResult = await this.operationalResolver(
+          project, session, this.jobsSnapshot().items || [],
+        );
+      } catch (error) {
+        candidate.operationalResult = { status: 'failed', error: String(error.message || error) };
+      }
+    }
+    const result = candidate.operationalResult;
+    const resolution = result?.resolution;
+    const identity = candidate.stop.episodeId || candidate.stop.tailHash;
+    const resolutionKey = `operational-resolution:${session.projectId}:${session.pid}:${identity}`;
+    if (result?.status !== 'completed' || !resolution?.grounding?.eligible) {
+      this.store.createAutomationEvent({
+        eventKey: resolutionKey,
+        category: 'session_control', eventType: 'AI_SESSION_RESOLUTION_WITHHELD',
+        targetId: session.projectId, severity: 'warn', status: 'RESOLVED',
+        title: `AI session response withheld: ${session.projectId}`,
+        message: 'Codex could not produce a sufficiently grounded response for this stopped episode, so FIRM sent nothing.',
+        source: { deliveryPolicy: 'none', pid: session.pid, resolverStatus: result?.status || 'unknown' },
+        note: String(result?.error || 'ungrounded_operational_resolution').slice(0, 500),
+      });
+      return { done: true };
+    }
+    this.store.createAutomationEvent({
+      eventKey: resolutionKey,
+      category: 'session_control', eventType: 'AI_SESSION_DECISION',
+      targetId: session.projectId, severity: 'info', status: 'RESOLVED',
+      title: `AI session decision for ${session.projectId}`,
+      message: resolution.rationale,
+      source: {
+        deliveryPolicy: 'none', pid: session.pid,
+        evidenceSource: resolution.evidenceSource,
+        evidenceQuote: resolution.evidenceQuote,
+        confidence: resolution.confidence,
+        shouldSend: resolution.shouldSend,
+        recheckAfterSeconds: resolution.recheckAfterSeconds,
+      },
+    });
+    if (!resolution.shouldSend) {
+      if (resolution.recheckAfterSeconds > 0) {
+        candidate.operationalResult = null;
+        return {
+          done: false,
+          deferUntil: this.now().getTime() + resolution.recheckAfterSeconds * 1000,
+        };
+      }
+      return { done: true };
+    }
+
+    let currentSession = null;
+    try {
+      const fresh = await this.discoverExternalSessions();
+      currentSession = (fresh.items || []).find((item) => (
+        item.projectId === session.projectId && item.pid === session.pid
+      )) || null;
+    } catch {
+      currentSession = null;
+    }
+    const currentEvidenceAt = currentSession?.heartbeat?.episodeId
+      || currentSession?.heartbeat?.historyCursor
+      || currentSession?.heartbeat?.historyWriteAt
+      || currentSession?.heartbeat?.lastProgressAt || null;
+    const sameEpisode = Boolean(currentSession)
+      && AI_INPUT_STATES.has(currentSession.terminal?.state)
+      && (
+        (candidate.waitingEvidenceAt && currentEvidenceAt
+          && candidate.waitingEvidenceAt === currentEvidenceAt)
+        || (!candidate.waitingEvidenceAt && !currentEvidenceAt
+          && currentSession.terminal?.tailHash === candidate.stop.tailHash)
+      );
+    if (!sameEpisode) {
+      this.store.createAutomationEvent({
+        eventKey: `${resolutionKey}:stale`,
+        category: 'session_control', eventType: 'AI_SESSION_RESPONSE_STALE',
+        targetId: session.projectId, severity: 'info', status: 'RESOLVED',
+        title: `Discarded stale AI response: ${session.projectId}`,
+        message: 'The Claude session advanced while Codex was deciding, so the old response was not delivered.',
+        source: { deliveryPolicy: 'none', pid: session.pid, resolutionKey },
+      });
+      return { done: true };
+    }
+
+    const now = this.now().getTime();
+    const hourAgo = now - 60 * 60 * 1000;
+    const recoveries = this.store.listAutomationEvents(5000).filter((event) => (
+      event.targetId === session.projectId
+      && event.eventType === 'AI_SESSION_MESSAGE_SENT'
+      && Date.parse(event.collectedAt || event.createdAt || 0) >= hourAgo
+    ));
+    const limit = this.config.operationalResolver?.maxMessagesPerHour ?? 3;
+    if (recoveries.length >= limit) {
+      this.store.createAutomationEvent({
+        eventKey: `${resolutionKey}:message-limit`,
+        category: 'session_control', eventType: 'AI_SESSION_MESSAGE_LIMIT_REACHED',
+        targetId: session.projectId, severity: 'error', status: 'RESOLVED',
+        title: `AI session message limit reached: ${session.projectId}`,
+        message: 'Codex requested another response, but the bounded hourly message budget is exhausted.',
+        source: { deliveryPolicy: 'manual', pid: session.pid, recoveries: recoveries.length, limit },
+      });
+      return { done: true };
+    }
+    const latest = recoveries.sort((a, b) => (
+      Date.parse(b.collectedAt || b.createdAt || 0) - Date.parse(a.collectedAt || a.createdAt || 0)
+    ))[0];
+    const latestAt = latest ? Date.parse(latest.collectedAt || latest.createdAt || 0) : NaN;
+    const cooldownMs = this.config.operationalResolver?.cooldownMs ?? 5 * 60 * 1000;
+    if (Number.isFinite(latestAt) && now - latestAt < cooldownMs) {
+      return { done: false, deferUntil: latestAt + cooldownMs };
+    }
+
+    const event = this.store.createAutomationEvent({
+      eventKey: `${resolutionKey}:message`,
+      category: 'session_control', eventType: 'AI_SESSION_MESSAGE_SENT',
+      targetId: session.projectId, severity: 'info',
+      title: `AI responded to stopped session: ${session.projectId}`,
+      message: resolution.rationale,
+      source: { deliveryPolicy: 'auto_notify', pid: session.pid, resolutionKey },
+    });
+    if (['ROUTINE_CHOICE', 'BOUNDARY_CHOICE', 'INTERACTIVE_CONFIRMATION']
+      .includes(currentSession.terminal?.state)) {
+      if (!this.externalSessionDismissChoice) return { done: false };
+      await this.externalSessionDismissChoice(currentSession);
+    }
+    const delivery = await this.#sendExternalAcknowledged({
+      event, session: currentSession, prompt: resolution.message,
+      note: 'codex_autonomous_session_response',
+    });
+    return { done: delivery.status !== 'failed' };
+  }
+
   async #reconcileForegroundInteractions(sessions) {
     const handled = new Set();
     for (const session of sessions) {
@@ -625,14 +718,8 @@ export class AutomationEngine {
       const terminal = session.terminal || {};
       const prior = this.externalInteractionActions.get(key);
       const priorStillVisible = prior?.kind === 'acked_draft'
-        ? terminal.state === 'DRAFT_PENDING_ENTER'
-          && terminal.draftDeliveryMarker === prior.marker
-        : prior?.kind === 'routine_choice'
-          ? terminal.state === 'ROUTINE_CHOICE'
-          : prior?.kind === 'routine_question'
-            ? terminal.state === 'WAITING_INPUT'
-              && session.heartbeat?.latestAssistantAt === prior.latestAssistantAt
-          : false;
+        && terminal.state === 'DRAFT_PENDING_ENTER'
+        && terminal.draftDeliveryMarker === prior.marker;
       if (prior && !priorStillVisible) {
         const event = this.store.getAutomationEvent(prior.eventKey);
         if (event && ['PENDING', 'HELD', 'SENT'].includes(event.status)) {
@@ -702,120 +789,6 @@ export class AutomationEngine {
         continue;
       }
 
-      if (terminal.state === 'WAITING_INPUT'
-          && routineQuestion(session.heartbeat?.latestAssistantText)) {
-        handled.add(key);
-        const latestAssistantAt = session.heartbeat?.latestAssistantAt || 'unknown';
-        const questionIdentity = createHash('sha256').update(JSON.stringify({
-          latestAssistantAt,
-          text: session.heartbeat?.latestAssistantText,
-        })).digest('hex').slice(0, 24);
-        const eventKey = `interaction:${session.projectId}:${session.pid}:question:${questionIdentity}`;
-        if (prior?.eventKey === eventKey) continue;
-        const event = this.store.createAutomationEvent({
-          eventKey, category: 'session_control', eventType: 'ROUTINE_QUESTION_RETURNED_TO_CLAUDE',
-          targetId: session.projectId, severity: 'info',
-          title: `Returned routine question to Claude: ${session.projectId}`,
-          message: 'Claude asked an ordinary research or engineering question, so FIRM returned it for self-resolution without supplying a new goal or scientific direction.',
-          source: { deliveryPolicy: 'none', pid: session.pid },
-        });
-        const delivery = await this.#sendExternalAcknowledged({
-          event, session, prompt: selfResolveQuestionPrompt(),
-          note: 'routine_question_returned_to_claude',
-        });
-        if (delivery.status !== 'failed') {
-          this.externalInteractionActions.set(key, {
-            eventKey, kind: 'routine_question', latestAssistantAt,
-            attempts: 1, lastAttemptAt: this.now().getTime(),
-          });
-        }
-        continue;
-      }
-
-      if (terminal.state !== 'ROUTINE_CHOICE') continue;
-      handled.add(key);
-      const choiceIdentity = createHash('sha256').update(JSON.stringify({
-        selectedOptionNumber: terminal.selectedOptionNumber,
-        selectedOptionText: terminal.selectedOptionText,
-        recommendedSelected: terminal.recommendedSelected,
-      })).digest('hex').slice(0, 24);
-      const eventKey = `interaction:${session.projectId}:${session.pid}:choice:${choiceIdentity}`;
-      if (prior?.eventKey === eventKey) {
-        const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
-        if (this.now().getTime() - prior.lastAttemptAt < retryDelayMs) continue;
-        if (prior.attempts >= 3) {
-          this.store.createAutomationEvent({
-            eventKey: `${eventKey}:selection-exhausted`, category: 'session_control',
-            eventType: 'ROUTINE_RECOMMENDATION_ACCEPT_EXHAUSTED',
-            targetId: session.projectId, severity: 'error',
-            title: `Routine choice did not advance: ${session.projectId}`,
-            message: 'The same Claude recommendation remained selected after three Enter attempts.',
-            source: { deliveryPolicy: 'manual', pid: session.pid },
-          });
-          continue;
-        }
-      }
-      if (terminal.recommendedSelected) {
-        if (typeof this.externalSessionSubmit !== 'function') continue;
-        try {
-          await this.externalSessionSubmit(session);
-          this.store.createAutomationEvent({
-            eventKey, category: 'session_control', eventType: 'ROUTINE_RECOMMENDATION_ACCEPTED',
-            targetId: session.projectId, severity: 'info', status: 'SENT',
-            title: `Accepted Claude's routine recommendation: ${session.projectId}`,
-            message: `Claude marked option ${terminal.selectedOptionNumber} as Recommended; FIRM confirmed that option and will verify interaction progress.`,
-            source: {
-              deliveryPolicy: 'none', pid: session.pid,
-              selectedOptionNumber: terminal.selectedOptionNumber,
-              selectedOptionText: terminal.selectedOptionText,
-            },
-          });
-          this.externalInteractionActions.set(key, {
-            eventKey, kind: 'routine_choice',
-            attempts: (prior?.attempts || 0) + 1,
-            lastAttemptAt: this.now().getTime(),
-          });
-        } catch (error) {
-          this.store.createAutomationEvent({
-            eventKey, category: 'session_control', eventType: 'ROUTINE_RECOMMENDATION_ACCEPT_FAILED',
-            targetId: session.projectId, severity: 'error',
-            title: `Could not confirm routine recommendation: ${session.projectId}`,
-            message: 'Claude remains at its routine choice menu.',
-            source: { deliveryPolicy: 'manual', pid: session.pid },
-            note: String(error.message || error).slice(0, 500),
-          });
-        }
-        continue;
-      }
-
-      if (!this.externalSessionDismissChoice || !this.externalSessionInput) continue;
-      try {
-        await this.externalSessionDismissChoice(session);
-        const event = this.store.createAutomationEvent({
-          eventKey, category: 'session_control', eventType: 'ROUTINE_CHOICE_RETURNED_TO_CLAUDE',
-          targetId: session.projectId, severity: 'info',
-          title: `Returned routine choice to Claude: ${session.projectId}`,
-          message: 'The menu had no recommended selection, so FIRM dismissed it and instructed Claude to decide from existing evidence.',
-          source: { deliveryPolicy: 'none', pid: session.pid },
-        });
-        await this.#sendExternalAcknowledged({
-          event, session, prompt: selfResolveChoicePrompt(),
-          note: 'routine_choice_returned_to_claude',
-        });
-        this.externalInteractionActions.set(key, {
-          eventKey, kind: 'routine_choice', attempts: 1,
-          lastAttemptAt: this.now().getTime(),
-        });
-      } catch (error) {
-        this.store.createAutomationEvent({
-          eventKey, category: 'session_control', eventType: 'ROUTINE_CHOICE_SELF_RESOLUTION_FAILED',
-          targetId: session.projectId, severity: 'error',
-          title: `Could not return routine choice to Claude: ${session.projectId}`,
-          message: 'The ordinary choice remains unresolved.',
-          source: { deliveryPolicy: 'manual', pid: session.pid },
-          note: String(error.message || error).slice(0, 500),
-        });
-      }
     }
     return handled;
   }
@@ -1747,7 +1720,7 @@ export class AutomationEngine {
 }
 
 export const automationInternals = Object.freeze({
-  eventProject, queuePrompt, automationPrompt, goalPrompt, selfResolveChoicePrompt,
+  eventProject, queuePrompt, automationPrompt, goalPrompt,
   acceptsExternalOperationalInput, acceptsManagedOperationalInput,
   deliveryKey, acknowledgedPrompt,
 });

@@ -25,7 +25,7 @@ test('operational state separates model work, tools, review, policy, and deliver
     events: [{ targetId: 'P', status: 'PENDING', eventType: 'SESSION_PROGRESS_STALLED' }],
   }).state, 'PROGRESS_STALLED');
   assert.equal(deriveOperationalState(session('WAITING_INPUT'), {
-    goalBudgetReached: true,
+    goalPolicy: { enabled: true }, goalBudgetReached: true,
   }).state, 'POLICY_HELD');
   assert.equal(deriveOperationalState(session('WORKING'), {
     goalBudgetReached: true,
@@ -84,7 +84,7 @@ test('an active construction lease suppresses generic continuation state', () =>
   assert.match(value.reason, /method-v1/);
 });
 
-test('an authoritative active job stays silent even when Claude omitted the marker', () => {
+test('an unrelated active project job cannot turn an input point into a job wait', () => {
   const value = deriveOperationalState({
     projectId: 'ACL_1',
     terminal: { state: 'WAITING_INPUT' },
@@ -92,8 +92,27 @@ test('an authoritative active job stays silent even when Claude omitted the mark
   }, {
     jobs: { items: [{ runId: 'ACL_1_train', projectId: 'ACL_1', kind: 'gpu', state: 'running' }] },
   });
-  assert.equal(value.state, 'JOB_ACTIVE_UNDECLARED');
-  assert.match(value.reason, /suppress scientific review or generic continuation/);
+  assert.equal(value.state, 'READY_FOR_INPUT');
+  assert.deepEqual(value.details.undeclaredActiveJobs, [{
+    runId: 'ACL_1_train', kind: 'gpu', state: 'running', purpose: null,
+  }]);
+});
+
+test('a disabled goal policy cannot create a policy hold', () => {
+  const value = deriveOperationalState(session('WAITING_INPUT'), {
+    goalPolicy: { enabled: false }, goalBudgetReached: true,
+  });
+  assert.equal(value.state, 'READY_FOR_INPUT');
+});
+
+test('terminal and missing declared runs are stale evidence, not an active wait', () => {
+  const value = deriveOperationalState(session('WAITING_INPUT', {
+    waitingForJobRunIds: ['P_done', 'P_missing'],
+  }), {
+    jobs: { items: [{ runId: 'P_done', projectId: 'P', kind: 'gpu', state: 'done' }] },
+  });
+  assert.equal(value.state, 'READY_FOR_INPUT');
+  assert.deepEqual(value.details.staleDeclaredRunIds, ['P_done', 'P_missing']);
 });
 
 test('an uncertain transport is quarantined and does not block the session', () => {

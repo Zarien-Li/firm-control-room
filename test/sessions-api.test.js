@@ -224,6 +224,49 @@ test('external iTerm API reports pause state and sends only the fixed continuati
   }
 });
 
+test('global Goal Loop disable hides persisted policies from operational state', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-global-goal-disabled-'));
+  const project = { id: 'P', name: 'P', path: root, expected: {} };
+  const manager = new SessionManager({
+    projects: [project], executable: '/fixed/claude', controlDir: join(root, 'control'),
+    pty: new FakePty(),
+  });
+  const app = await createApp({
+    dataDir: join(root, 'data'), projects: [project], scanIntervalMs: 0,
+    codexAuditEnabled: false,
+    gpuQueue: { enabled: false, pollMs: 1000, schedulerAutoStart: false },
+    goalLoop: {
+      enabled: false, graceMs: 1, cooldownMs: 1, maxContinuesPerDay: 1,
+      budgetEpoch: '2026-08-01T00:00:00.000Z', enterRetryMs: 1, postAckStallMs: 1,
+    },
+    sessionManager: manager,
+    externalSessionsCollector: async () => ({
+      status: 'ok', terminalStatus: 'ok', items: [{
+        pid: 42, projectId: 'P', mappingStatus: 'mapped', tty: 'ttys019',
+        terminal: { state: 'WAITING_INPUT', reason: 'claude_input_prompt_visible' },
+        heartbeat: { status: 'ok', waitingForJobRunIds: [] },
+      }],
+    }),
+  });
+  try {
+    app.store.setAutomationPolicy('P', { enabled: true, objective: 'historical objective' });
+    const event = app.store.createAutomationEvent({
+      eventKey: 'goal:historical', category: 'goal_loop', eventType: 'GOAL_CONTINUE',
+      targetId: 'P', severity: 'info', title: 'Historical continue', message: 'Old action.',
+    });
+    app.store.setAutomationEvent(event.id, {
+      status: 'DELIVERED', deliveredAt: '2026-08-12T00:00:00.000Z',
+    });
+    const address = await app.listen(0, '127.0.0.1');
+    const response = await fetch(`http://127.0.0.1:${address.port}/api/external-sessions`);
+    const body = await response.json();
+    assert.equal(body.items[0].operationalState, 'READY_FOR_INPUT');
+  } finally {
+    await app.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('managed session API validates JSON and exposes the PTY lifecycle', async () => {
   const root = await mkdtemp(join(tmpdir(), 'firm-session-api-'));
   const project = { id: 'ACL_1', name: 'ACL_1', path: join(root, 'ACL_1'), expected: {} };

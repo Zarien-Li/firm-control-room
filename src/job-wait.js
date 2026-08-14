@@ -17,9 +17,19 @@ export function jobWaitStatus(session, registry) {
   const declared = new Set(session?.heartbeat?.waitingForJobRunIds || []);
   const active = activeJobs(registry, targetId);
   const matched = active.filter((item) => declared.has(item.runId));
+  const allJobs = registry?.items || [];
+  const declaredJobs = allJobs.filter((item) => declared.has(item.runId));
+  const ownedDeclaredJobs = declaredJobs.filter((item) => jobBelongsToTarget(item, targetId));
+  const terminalDeclaredJobs = ownedDeclaredJobs.filter((item) => !ACTIVE_JOB_STATES.has(item.state));
+  const knownDeclaredRunIds = new Set(declaredJobs.map((item) => item.runId));
   return {
     waiting: targetId !== null && declared.size > 0 && matched.length > 0,
     declaredRunIds: [...declared], activeRunIds: active.map((item) => item.runId),
     matchedRunIds: matched.map((item) => item.runId), matchedJobs: matched,
+    terminalDeclaredRunIds: terminalDeclaredJobs.map((item) => item.runId),
+    missingDeclaredRunIds: [...declared].filter((runId) => !knownDeclaredRunIds.has(runId)),
+    foreignDeclaredRunIds: declaredJobs
+      .filter((item) => !jobBelongsToTarget(item, targetId))
+      .map((item) => item.runId),
   };
 }

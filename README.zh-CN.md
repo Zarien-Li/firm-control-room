@@ -2,54 +2,37 @@
 
 # FIRM Control Room
 
-### 面向并行 AI 研究的本地控制平面
+### 让多个 Claude Code 研究会话持续推进，同时保留真正的科学控制权。
 
-[![CI](https://github.com/Zarien-Li/firm-control-room/actions/workflows/ci.yml/badge.svg)](https://github.com/Zarien-Li/firm-control-room/actions/workflows/ci.yml)
-[![Node 26+](https://img.shields.io/badge/Node.js-26%2B-3c873a)](https://nodejs.org/)
-[![macOS](https://img.shields.io/badge/platform-macOS-111111)](https://www.apple.com/macos/)
-[![MIT](https://img.shields.io/badge/license-MIT-2f81f7)](LICENSE)
-
-**知道每个研究 Agent 正在做什么、在等什么，以及什么时候才真的需要干预。**
-
-[五分钟启动](#五分钟启动) · [任务注册表](#firm-job-registry) · [科学控制](#科学控制) · [English](README.md)
+[English](README.md) · [快速开始](#五分钟启动) · [GPU 接入](#可选gpu-队列)
 
 </div>
 
 ---
 
-多开几个 Claude Code 终端很容易，困难的是让它们长期并行研究而不失去控制。
+多开几个终端很容易。困难的是判断多个研究 Agent 到底是在工作、运行工具、等待真实实验、悄悄停下，还是已经钻进了一个低价值局部问题。
 
-看到输入框，不代表 Claude 真的停了；安静的日志，不代表远端实验已经死亡；文字被粘贴进终端，也不代表它按下了回车；Codex 能发现偏移，也可能因为过度审查反过来带偏主 PI。
+FIRM 把 Claude 历史、终端状态、进程树、项目产物、持久消息确认、可选 GPU 队列和无状态 Codex 审计组合成一个本地控制台。它可以在用户授权的目标下持续推进项目，但不会把研究路线交给一个审稿型模型裁决。
 
-FIRM 把这些状态明确分开。它是**研究控制平面，不是又一个研究 Agent**。
+## 它解决什么
 
-## FIRM 管理的三层事实
-
-| 层面 | FIRM 使用的证据 | 避免的问题 |
-|---|---|---|
-| **研究会话** | Claude 历史、终端、进程树、产物写入、消息 ACK | 假停顿、重复续写、未发送草稿、会话丢失 |
-| **长任务** | GPU、CPU、SSH 和本地任务的持久身份与生命周期 | 从自然语言猜状态、PID 复用、过期完成通知、虚假等待 |
-| **科学边界** | 冻结的项目权威文件与有界近期证据 | 研究范围静默漂移、审查模型接管方法路线 |
-
-因此，FIRM 可以区分 `MODEL_WORKING`、`TOOL_RUNNING`、`WAITING_FOR_JOB`、`WAITING_REVIEW` 和真正的输入点，而不是把每次暂停都当成故障。
-
-## 为什么它不是普通 Agent Dashboard
-
-- **粘贴不等于送达。** 消息必须经过持久 outbox，并在 Claude 历史里出现唯一 marker 才算完成。
-- **PID 不等于任务身份。** 进程同时绑定 PID、操作系统启动时间和 argv 指纹，防止 PID 复用或错误关联。
-- **安静不等于失败。** 只有 Registry 独立确认的同项目活跃任务，才能让研究会话合法等待。
-- **利用率不等于操作权限。** GPU 利用率低只是诊断信号，不能授权停止 worker。
-- **审查不等于领导。** Codex 可以发现边界偏移，但不能选择方法、追加实验、改变论文类型或关闭研究方向。
-- **不确定性不会被藏起来。** 模糊终端、传输、进程和策略状态会保留为独立状态，不会伪装成“正常”。
+| 原来的问题 | FIRM 的处理 |
+|---|---|
+| 看到提示符，却不知道 Claude 停了还是工具仍在收尾 | 显式区分 `MODEL_WORKING`、`TOOL_RUNNING`、`WAITING_FOR_JOB`、`READY_FOR_INPUT` |
+| “继续”可能重复粘贴、没有按回车或没有进入 Claude 历史 | SQLite outbox、唯一消息标记和历史 ACK |
+| 长会话逐渐把原始研究问题换成局部叙事 | 只读证据快照与隔离的 Codex 边界审计 |
+| Codex 审查反过来发明实验、提高门槛和带偏主 PI | Codex 只能识别边界漂移，不能决定方法、主张、停止或 GPU 操作 |
+| GPU 申请时依赖、数据和评测代码还没准备好 | 可选 readiness gate、生命周期队列和阶段感知遥测 |
+| 等待实验结果被误判成项目停摆 | 必须用权威队列核验同项目、同 run ID 的活跃实验 |
 
 ## 五分钟启动
 
 ### 环境要求
 
-- macOS；外部 iTerm 发现与控制目前依赖 macOS
+- macOS；外部 iTerm 会话控制目前是 macOS 专属能力
 - Node.js 26+
 - 已安装并登录 Claude Code
-- 只有启用独立边界审查时才需要 Codex CLI
+- 需要独立巡检时安装并登录 Codex CLI；否则可关闭该功能
 
 ### 1. 安装
 
@@ -59,7 +42,7 @@ cd firm-control-room
 npm ci
 ```
 
-### 2. 建立项目
+### 2. 建立第一个项目
 
 ```bash
 mkdir -p "$HOME/research"
@@ -67,7 +50,7 @@ cp -R examples/research-project "$HOME/research/project-alpha"
 cp config/projects.example.json config/projects.json
 ```
 
-修改 `config/projects.json`，并填写项目模板：
+在模板文件中替换研究对象、价值指标、Seed 和当前状态。若目录或名称不同，再修改 `config/projects.json`。
 
 ```text
 ~/research/project-alpha/
@@ -80,8 +63,6 @@ cp config/projects.example.json config/projects.json
 └── prompt.txt
 ```
 
-这些文件把长期研究权威与会话临时叙事分离。FIRM 只读取小型白名单，不会递归吞入整个研究仓库。
-
 ### 3. 自检并启动
 
 ```bash
@@ -89,132 +70,80 @@ npm run doctor
 npm start
 ```
 
-打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。可以在网页中启动托管 Claude，也可以继续使用配置目录中的现有 iTerm Claude 会话，由 FIRM 自动发现。
+打开 [http://127.0.0.1:8787](http://127.0.0.1:8787)。可以由控制台启动托管 Claude，也可以继续在已配置项目目录中使用 iTerm，FIRM 会自动发现其主进程。
 
-只启用运行管理，不使用 Codex 审查：
+不使用 Codex 审计时：
 
 ```bash
 FIRM_CODEX_AUDIT_ENABLED=false npm start
 ```
 
-## 系统结构
+## 自动化边界
 
-```mermaid
-flowchart LR
-    UI["本地控制台"] --> WEB["FIRM 控制平面"]
-    WEB --> BROKER["持久 PTY Broker"]
-    BROKER --> CLAUDE["Claude Code 会话"]
-    WEB --> HISTORY["历史与进程证据"]
-    WEB --> STORE["SQLite 状态与消息 Outbox"]
-    WEB --> JOBS["FIRM Job Registry"]
-    JOBS --> LOCAL["本地 CPU 任务"]
-    JOBS --> SSH["远端 / SSH 任务"]
-    JOBS --> GPU["可选 GPU Scheduler"]
-    WEB -. 有界证据 .-> CODEX["临时 Codex 审查"]
-```
+- broker 持有 Claude PTY，网页或 Web 服务重启不会杀死托管会话；
+- Goal Loop 必须由用户逐项目开启，并设置目标和每日次数上限；
+- 每个新的、稳定的 Claude 输入停点都会交给短生命周期 Codex；Codex 直接理解上下文，自主决定是否回复以及回复什么，不再由代码预设错误、等待或“用户边界”类别；
+- 机器层仅保留 `send / message / recheck_after_seconds` 这个最小执行协议；Codex 可回答问题、选择选项、恢复中断动作或保持沉默，超时、低置信度或停点引文无法核验时不发送；
+- 外部消息必须在 Claude JSONL 中出现唯一 delivery marker 才算送达；
+- 普通输入点稳定出现后立即触发一次无状态 Codex 会话决策；
+- Codex 只能检查 identity、scope、evidence、compute 和 operation drift；
+- 权限确认、破坏性操作和无法证明的终端状态不会被自动回答；
+- FIRM 不允许网页执行任意 shell，不替 PI 选择方法或论文类型。
 
-PTY Broker 独立于浏览器和 Web 进程存活。会话状态由终端表面、Claude 主链历史、子工具进程和白名单产物写入共同确认；长任务事实则由 Job Registry 单独负责。
+## 合法等待长任务
 
-## FIRM Job Registry
+一个项目只有同时满足以下条件才进入 `WAITING_FOR_JOB`：
 
-每个 GPU、CPU、SSH 或本地长任务都有一个持久 `runId` 和唯一生命周期：
+1. Claude 最新 assistant 事件输出唯一受支持的精确标记 `[FIRM WAITING_FOR_JOB run_id=<run_id>]`；
+2. FIRM Job Registry 中同一项目、同一 run ID 确实为 `pending` 或 `running`。
 
-```text
-pending → running → done | failed | cancelled
-```
+只有这两条证据交叉成立，FIRM 才抑制普通续跑。任务进入 `done`、`failed` 或 `cancelled` 后，旧标记立即失效；缺失、跨项目或仅计划中的 run ID 也不成立。同项目存在另一个 active job 只是附加信息，绝不能被推断为当前 session 的依赖。GPU、本地 CPU、远程 CPU 和 SSH 长任务共用这一个协议，不再兼容旧的 `WAITING_FOR_GPU` 双轨标记。
 
-“暂时看不见进程”只是可观测性元数据，不能擅自改变任务生命周期。
+## 可选GPU 队列
 
-### 注册非 GPU 任务
-
-```bash
-scripts/run-registered-job.sh RUN_ID PROJECT_ID local_cpu -- command arg...
-scripts/run-registered-job.sh RUN_ID PROJECT_ID remote_cpu -- ssh host command...
-scripts/run-registered-job.sh RUN_ID PROJECT_ID ssh -- ssh host command...
-```
-
-API：
-
-```text
-GET  /api/jobs
-POST /api/jobs
-POST /api/jobs/:runId/status
-```
-
-默认查询只返回所有活跃任务和最近完成的任务。完整历史使用 `?view=history&limit=25&cursor=...` 游标分页，避免项目长期运行后 API 无限膨胀。
-
-Claude 只有输出以下唯一机器标记时，才可能进入合法等待：
-
-```text
-[FIRM WAITING_FOR_JOB run_id=<run_id>]
-```
-
-FIRM 还会独立确认 Registry 中同项目、同 run ID 确实处于 `pending` 或 `running`。缺失、完成、失败、取消、跨项目和仅计划中的任务都不能压制会话恢复逻辑。
-
-### 可选 GPU 接入
-
-公开版默认关闭 GPU 集成。接入自己的 SSH Scheduler：
+公开版默认关闭远端 GPU 集成。接入自己的 SSH 队列时：
 
 ```bash
 export FIRM_GPU_QUEUE_ENABLED=true
 export FIRM_GPU_SCHEDULER_AUTO_START=true
 export FIRM_GPU_QUEUE_HOST=user@gpu-control-host
 export FIRM_GPU_QUEUE_SSH_PORT=22
-export FIRM_GPU_QUEUE_DOCKER_CONTAINER=research-container
 export FIRM_GPU_QUEUE_ROOT=/absolute/remote/path/to/gpu_queue
-export FIRM_GPU_PROJECT_ROOT=/absolute/remote/path/to/projects
+export FIRM_GPU_QUEUE_DOCKER_CONTAINER=research-container
 npm start
 ```
 
-GPU Adapter 会把以下状态同步进 Registry：
+`scripts/submit-gpu-request.sh` 会从环境或 `.env.local` 读取这些值。还可以用
+`FIRM_GPU_QUEUE_ALLOWED_PROJECTS` 和 `FIRM_GPU_QUEUE_PROJECT_ROOT` 限制允许提交的项目。
+
+队列状态协议为：
 
 ```text
 pending/.submitted → running/.started → done|failed|cancelled/.ready
 ```
 
-FIRM 只通过固定 SSH Collector 观察队列；worker 的启动和终止始终由你的 Scheduler 独占。
-
-## 科学控制
-
-### 项目 Claude 仍是主 PI
-
-日常解释、方法设计、实验和主张由项目会话负责。通用 Goal Loop 默认全局关闭；系统可以处理普通菜单，但权限确认和真正属于用户的决定不会被代答。
-
-### Codex 只是有边界的审查器
-
-启用时，Codex 以短生命周期、只读进程读取“项目权威优先”的有界证据包。它可以指出 identity、scope、evidence、compute 或 operation drift，但不能发明下一方法、追加 baseline、提高验收门槛、改变论文身份或发布 stop/freeze/retire 结论。
-
-若已有外部系统负责组合级科学审查，可以关闭 FIRM 的周期审查：
-
-```bash
-FIRM_SCAN_INTERVAL_MS=0 FIRM_CODEX_AUDIT_ENABLED=false npm start
-```
-
-此时 FIRM 只管理会话、消息投递、Job Registry 和运行故障恢复。
+启用前需要把 `config/` 中的 Scheduler 模板适配到自己的集群。FIRM 只通过固定 SSH 采集器读取状态；GPU worker 的启动与终止仍然只属于你的 Scheduler。
 
 ## 验证
 
 ```bash
 npm run check
-npm run check:jobs
 npm test
 npm run smoke
 npm run acceptance:restart
 ```
 
-当前 **142 项测试**覆盖 Web/Broker 重启、延迟 ACK、未发送草稿、发送中断、PID 复用、任务历史分页、合法任务等待、历史事件重放、终端噪声、进程歧义、GPU monitor 丢失和重复消息防护。
+测试覆盖 Web/broker 重启、延迟 ACK、发送中断、终端噪声、快速工作周期、采集器降级、GPU monitor 丢失、合法 GPU 等待和消息防重。
 
-## 安全与限制
+## 安全提醒
 
 - 默认只监听 `127.0.0.1`，没有多用户认证，不要直接暴露到公网；
-- 项目采集只读且有固定白名单，运行数据保存在 `var/`；
-- Web API 只能使用已配置项目、固定程序、固定参数和固定工作目录；
-- Codex 只读运行，项目和 session 文本一律视为不可信证据；
-- Queue 中的自由文本不会直接注入研究会话；
-- 正常情况下只有用户显式操作才能终止 Claude 会话；
-- `var/`、`work/`、本地项目配置、日志和环境文件不会进入 Git。
+- 项目文件只读且有固定白名单，运行数据写入 `var/`；
+- `var/`、`work/`、真实项目配置、日志和环境文件不会进入 Git；
+- Codex 以只读短进程运行，项目与 session 文本全部作为不可信证据；
+- GPU 利用率只是诊断信号，不能单独授权停卡或缩卡。
 
-FIRM 是从真实多项目研究工作流中提取出的早期开源版本。它宁可明确报告“不确定”，也不在猜测的状态上构建自信的自动化。
+完整设计、配置项和架构图见 [English README](README.md)。
 
 ## 许可证
 

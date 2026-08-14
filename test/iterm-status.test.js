@@ -175,6 +175,30 @@ test('a FIRM draft can be submitted into Claude Code while the model is running'
   });
 });
 
+test('a truncated Claude working footer wins over the editable empty prompt', () => {
+  assert.deepEqual(classifyItermTail([
+    '✻ Processing… (4m 16s)',
+    '❯ ',
+    '────────────────',
+    '  ⏵⏵ auto mode on (shift+tab to cycle) · esc to int…',
+  ].join('\n')), {
+    state: 'WORKING',
+    reason: 'model_working_with_editable_prompt',
+    acceptsQueuedInput: true,
+  });
+  assert.deepEqual(classifyItermTail([
+    'Compacting conversation… (6m 34s)',
+    '❯ ',
+    '────────────────',
+    '  ⏵⏵ auto mode on (shift+tab to cycle) · esc to …',
+    '                            0% until auto-compact',
+  ].join('\n')), {
+    state: 'WORKING',
+    reason: 'model_working_with_editable_prompt',
+    acceptsQueuedInput: true,
+  });
+});
+
 test('ordinary Claude menus are distinct from human-owned confirmations', () => {
   assert.deepEqual(classifyItermTail([
     'How should I unblock it?',
@@ -190,11 +214,17 @@ test('ordinary Claude menus are distinct from human-owned confirmations', () => 
     selectedOptionText: 'Start the GPU Scheduler (Recommended) Drain the existing queue.',
     recommendedSelected: true,
   });
-  assert.equal(classifyItermTail([
+  assert.deepEqual(classifyItermTail([
     '❯ 1. Grant permission to delete the dataset (Recommended)',
     '  2. Cancel',
     'Enter to select · Esc to cancel',
-  ].join('\n')).state, 'CONFIRMATION');
+  ].join('\n')), {
+    state: 'BOUNDARY_CHOICE',
+    reason: 'claimed_human_boundary_choice_visible',
+    selectedOptionNumber: 1,
+    selectedOptionText: 'Grant permission to delete the dataset (Recommended)',
+    recommendedSelected: true,
+  });
 });
 
 test('draft clear and choice dismiss are separate terminal actions', async () => {

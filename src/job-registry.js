@@ -146,7 +146,9 @@ export class JobRegistry {
 
   syncGpuQueue(snapshot, projectResolver = (item) => item.project) {
     if (snapshot?.status !== 'ok') return this.snapshot();
+    const seenRunIds = new Set();
     for (const item of snapshot.items || []) {
+      seenRunIds.add(item.runId);
       const projectId = projectResolver(item);
       if (!projectId) continue;
       const current = this.store.getJob(item.runId);
@@ -170,6 +172,7 @@ export class JobRegistry {
         const metadata = { remotePath: item.remotePath, signalAt: item.signalAt,
           phase: item.telemetry?.phase || null, submissionReadiness: item.submissionReadiness || null,
           efficiency: item.efficiency || null,
+          queueMissingObservations: 0,
           lifecycleObserved: current.metadata?.lifecycleObserved
             ?? ACTIVE_JOB_STATES.has(current.state) };
         const progress = item.telemetry?.progressMarker
@@ -187,6 +190,31 @@ export class JobRegistry {
           recordEvent: false, source: 'gpu_queue',
         });
       }
+    }
+    // A successful full queue snapshot is authoritative. Require two consecutive
+    // misses so an atomic directory move cannot create a false terminal state.
+    for (const current of this.store.listActiveJobs()) {
+      if (current.kind !== 'gpu' || seenRunIds.has(current.runId)) continue;
+      const misses = Number(current.metadata?.queueMissingObservations || 0) + 1;
+      if (misses < 2) {
+        this.update(current.runId, {
+          metadata: { queueMissingObservations: misses }, recordEvent: false,
+          source: 'gpu_queue_reconciler',
+        });
+        continue;
+      }
+      this.update(current.runId, {
+        state: 'failed',
+        result: {
+          ...(current.result || {}),
+          reason: 'queue_entry_missing_from_two_authoritative_snapshots',
+        },
+        metadata: {
+          queueMissingObservations: misses,
+          terminalReason: 'queue_entry_disappeared',
+        },
+        source: 'gpu_queue_reconciler',
+      });
     }
     return this.snapshot();
   }

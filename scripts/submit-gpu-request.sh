@@ -1,19 +1,33 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-HOST="${FIRM_GPU_QUEUE_HOST:-}"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+if [[ -f "$ROOT/.env.local" ]]; then
+  set -a
+  # shellcheck source=/dev/null
+  source "$ROOT/.env.local"
+  set +a
+fi
+
+: "${FIRM_GPU_QUEUE_HOST:?Set FIRM_GPU_QUEUE_HOST in the environment or .env.local}"
+: "${FIRM_GPU_QUEUE_DOCKER_CONTAINER:?Set FIRM_GPU_QUEUE_DOCKER_CONTAINER in the environment or .env.local}"
+: "${FIRM_GPU_QUEUE_ROOT:?Set FIRM_GPU_QUEUE_ROOT in the environment or .env.local}"
+
+HOST="$FIRM_GPU_QUEUE_HOST"
 PORT="${FIRM_GPU_QUEUE_SSH_PORT:-22}"
-CONTAINER="${FIRM_GPU_QUEUE_DOCKER_CONTAINER:-}"
-QUEUE_ROOT="${FIRM_GPU_QUEUE_ROOT:-}"
-PROJECT_ROOT="${FIRM_GPU_PROJECT_ROOT:-}"
+CONTAINER="$FIRM_GPU_QUEUE_DOCKER_CONTAINER"
+QUEUE_ROOT="$FIRM_GPU_QUEUE_ROOT"
+ALLOWED_PROJECTS="${FIRM_GPU_QUEUE_ALLOWED_PROJECTS:-}"
+REMOTE_PROJECT_ROOT="${FIRM_GPU_QUEUE_PROJECT_ROOT:-}"
+GPU_TYPE="${FIRM_GPU_QUEUE_GPU_TYPE:-NVIDIA GPU}"
 
 usage() {
   cat <<'EOF'
 Usage: submit-gpu-request.sh \
-  --project PROJECT_ALPHA \
+  --project ACL_2 \
   --purpose matched_eval \
-  --project-dir /srv/research/project-alpha \
-  --remote-command-file /srv/research/project-alpha/gpu_jobs/matched_eval.sh \
+  --project-dir /home/lzy/AAAI_2026/ACL_2/composable_peft \
+  --remote-command-file /home/lzy/AAAI_2026/ACL_2/composable_peft/gpu_jobs/matched_eval.sh \
   --estimated-time 2h --max-time 4h \
   --expected-utilization 70-100% \
   --progress-marker 'step=<n>/<total>'
@@ -37,14 +51,6 @@ EXPECTED_UTILIZATION=""
 PROGRESS_MARKER=""
 PREPARATION_EXCEPTION="none"
 
-for required in FIRM_GPU_QUEUE_HOST FIRM_GPU_QUEUE_DOCKER_CONTAINER \
-  FIRM_GPU_QUEUE_ROOT FIRM_GPU_PROJECT_ROOT; do
-  [[ -n "${!required:-}" ]] || {
-    echo "$required must be configured in the environment" >&2
-    exit 2
-  }
-done
-
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --project) PROJECT="${2:-}"; shift 2 ;;
@@ -64,15 +70,20 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-[[ "$PROJECT" =~ ^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$ ]] || {
-  echo "--project must be a portable project identifier" >&2; exit 2;
-}
+if [[ -n "$ALLOWED_PROJECTS" ]]; then
+  case ",${ALLOWED_PROJECTS// /}," in
+    *",$PROJECT,"*) ;;
+    *) echo "Unsupported project: $PROJECT" >&2; exit 2 ;;
+  esac
+fi
 [[ "$PURPOSE" =~ ^[a-z0-9][a-z0-9_-]{1,47}$ ]] || {
   echo "--purpose must match [a-z0-9][a-z0-9_-]{1,47}" >&2; exit 2;
 }
-[[ "$PROJECT_ROOT" == /* && "$PROJECT_DIR" == "$PROJECT_ROOT"/* ]] || {
-  echo "--project-dir must be under FIRM_GPU_PROJECT_ROOT" >&2; exit 2;
-}
+[[ "$PROJECT_DIR" == /* ]] || { echo "--project-dir must be absolute" >&2; exit 2; }
+if [[ -n "$REMOTE_PROJECT_ROOT" && "$PROJECT_DIR" != "$REMOTE_PROJECT_ROOT"/* ]]; then
+  echo "--project-dir must be under $REMOTE_PROJECT_ROOT" >&2
+  exit 2
+fi
 [[ "$COMMAND_FILE" == "$PROJECT_DIR"/* ]] || {
   echo "--remote-command-file must be inside --project-dir" >&2; exit 2;
 }
@@ -101,7 +112,7 @@ ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
   "docker exec -i '$CONTAINER' bash -s -- \
     '$QUEUE_ROOT' '$RUN_ID' '$PROJECT' '$PURPOSE' '$PROJECT_DIR' '$COMMAND_FILE' \
     '$PRIORITY' '$GPU_COUNT' '$ESTIMATED_TIME' '$MAX_TIME' '$FIRST_GPU_ACTION' \
-    '$EXPECTED_UTILIZATION' '$PROGRESS_MARKER' '$PREPARATION_EXCEPTION' '$CREATED_AT'" <<'REMOTE'
+    '$EXPECTED_UTILIZATION' '$PROGRESS_MARKER' '$PREPARATION_EXCEPTION' '$CREATED_AT' '$GPU_TYPE'" <<'REMOTE'
 set -euo pipefail
 QUEUE_ROOT=$1
 RUN_ID=$2
@@ -118,6 +129,7 @@ EXPECTED_UTILIZATION=${12}
 PROGRESS_MARKER=${13}
 PREPARATION_EXCEPTION=${14}
 CREATED_AT=${15}
+GPU_TYPE=${16}
 
 [[ -d "$PROJECT_DIR" ]] || { echo "Project directory missing: $PROJECT_DIR" >&2; exit 3; }
 [[ -f "$COMMAND_FILE" ]] || { echo "Command file missing: $COMMAND_FILE" >&2; exit 3; }
@@ -143,7 +155,7 @@ purpose: $PURPOSE
 project_dir: $PROJECT_DIR
 priority: $PRIORITY
 created_at: $CREATED_AT
-gpu_type: scheduler_selected
+gpu_type: $GPU_TYPE
 gpu_count: $GPU_COUNT
 estimated_time: $ESTIMATED_TIME
 max_time: $MAX_TIME

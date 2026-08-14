@@ -40,6 +40,36 @@ test('GPU queue synchronizes into the registry but stale pending cannot regress 
   store.close();
 });
 
+test('GPU queue requires two authoritative misses before failing a vanished active run', async () => {
+  const { store, registry } = await fixture();
+  registry.syncGpuQueue({ status: 'ok', items: [{
+    runId: 'ACL_3_vanished', project: 'ACL_3', state: 'running', remotePath: '/queue/running/x',
+  }] });
+  registry.syncGpuQueue({ status: 'ok', items: [] });
+  assert.equal(registry.get('ACL_3_vanished').state, 'running');
+  assert.equal(registry.get('ACL_3_vanished').metadata.queueMissingObservations, 1);
+  registry.syncGpuQueue({ status: 'ok', items: [] });
+  assert.equal(registry.get('ACL_3_vanished').state, 'failed');
+  assert.equal(
+    registry.get('ACL_3_vanished').result.reason,
+    'queue_entry_missing_from_two_authoritative_snapshots',
+  );
+  store.close();
+});
+
+test('a reappearing GPU run clears the missing-snapshot counter', async () => {
+  const { store, registry } = await fixture();
+  const running = { status: 'ok', items: [{
+    runId: 'ACL_8_reappeared', project: 'ACL_8', state: 'running', remotePath: '/queue/running/y',
+  }] };
+  registry.syncGpuQueue(running);
+  registry.syncGpuQueue({ status: 'ok', items: [] });
+  registry.syncGpuQueue(running);
+  assert.equal(registry.get('ACL_8_reappeared').state, 'running');
+  assert.equal(registry.get('ACL_8_reappeared').metadata.queueMissingObservations, 0);
+  store.close();
+});
+
 test('unknown liveness metadata never changes authoritative job state', async () => {
   const { store, registry } = await fixture();
   registry.register({

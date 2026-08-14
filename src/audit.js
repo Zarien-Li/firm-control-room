@@ -80,6 +80,24 @@ export function auditSnapshot(snapshot, now = new Date()) {
 
   for (const project of snapshot.projects) {
     const { expected = {}, identity, files = [], tmux = {} } = project;
+    const maturity = project.researchMaturity;
+    if (maturity?.status === 'missing') {
+      add(findings, 'RESEARCH_MATURITY_STATUS_MISSING', 'info', 'evidence', project.id,
+        '权威 live state 尚未提供双轨成熟度摘要',
+        { source: 'PIPELINE_STATE.md', maturityStatus: maturity.status },
+        '在下一次 consequential transition 写入 FIRM_RESEARCH_STATUS；无需中断当前原子动作');
+    }
+    for (const issue of maturity?.issues || []) {
+      add(findings, 'RESEARCH_MATURITY_INCONSISTENT', 'medium', 'evidence', project.id,
+        `研究成熟度描述不一致：${issue.message}`,
+        {
+          source: 'PIPELINE_STATE.md',
+          maturityStatus: maturity.status,
+          issue,
+          fields: maturity.fields,
+        },
+        '依据原始证据修正描述字段；FIRM 不改变科学结论或研究路线');
+    }
     for (const file of files) {
       if (file.status !== 'ok') {
         const identityFile = file.name === 'PROJECT_IDENTITY.json';

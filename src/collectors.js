@@ -5,6 +5,7 @@ import { basename, join, normalize, resolve, sep } from 'node:path';
 import { promisify } from 'node:util';
 import { collectItermStatuses } from './iterm-status.js';
 import { readClaudeHistoryHeartbeat } from './claude-history.js';
+import { parseResearchMaturity } from './research-maturity.js';
 
 const exec = promisify(execFile);
 export const ALLOWED_FILES = Object.freeze([
@@ -501,6 +502,7 @@ export async function collectSnapshot(projects, now = new Date(), options = {}) 
     const panes = projectSessions.map((session) => session.pane).filter(Boolean);
     const identityFile = files.find((file) => file.name === 'PROJECT_IDENTITY.json');
     const programFile = files.find((file) => file.name === 'PROGRAM_ORIGIN.md');
+    const stateFile = files.find((file) => file.name === 'PIPELINE_STATE.md');
     const parsedIdentity = parseIdentity(identityFile);
     const programAuthority = parseProgramAuthority(programFile);
     return {
@@ -520,6 +522,9 @@ export async function collectSnapshot(projects, now = new Date(), options = {}) 
         outsideScope: parsedIdentity.outsideScope || programAuthority.outsideScope || null,
       } : parsedIdentity,
       files,
+      researchMaturity: parseResearchMaturity(
+        stateFile?.status === 'ok' ? stateFile.content : '',
+      ),
       sessions: projectSessions,
       tmux: {
         status: tmux.status,

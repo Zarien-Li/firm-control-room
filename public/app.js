@@ -86,6 +86,7 @@ function automationNote(item) {
 
 function externalSessionLabel(session) {
   const state = session?.operationalState || session?.terminal?.state || 'STATE_UNCERTAIN';
+  if (state === 'WAITING_FOR_JOB') return registeredWaitLabel(session.operationalDetails?.matchedJobs || []);
   const labels = {
     MODEL_WORKING: '模型工作中',
     TOOL_RUNNING: '工具运行中',
@@ -96,7 +97,6 @@ function externalSessionLabel(session) {
     MESSAGE_PENDING_ACK: '消息待确认',
     DRAFT_PENDING_ENTER: '续跑文本待提交',
     WAITING_FOR_JOB: '等待已注册任务',
-    JOB_ACTIVE_UNDECLARED: '任务运行中（未声明等待）',
     RATE_LIMITED: '限额等待',
     TOOL_DRAINING: '工具仍在收尾',
     CONFIRMATION_REQUIRED: '等待权限确认',
@@ -106,6 +106,26 @@ function externalSessionLabel(session) {
     STATE_UNCERTAIN: '状态不确定',
   };
   return labels[state] || state;
+}
+
+function registeredWaitLabel(jobs) {
+  if (!jobs.length) return '状态冲突：无 Registry 依赖证据';
+  const count = jobs.length;
+  const kinds = new Set(jobs.map((job) => job.kind));
+  const states = new Set(jobs.map((job) => job.state));
+  if (kinds.size === 1 && kinds.has('gpu')) {
+    if (states.size === 1 && states.has('pending')) return `GPU 队列等待 · ${count}`;
+    if (states.size === 1 && states.has('running')) return `GPU 实验运行中 · ${count}`;
+    return `GPU 任务等待 · ${count}`;
+  }
+  const kindLabel = [...kinds].map((kind) => ({
+    local_cpu: 'CPU', remote_cpu: '远程 CPU', ssh: 'SSH', gpu: 'GPU', local: '本地',
+  }[kind] || kind)).join('/');
+  return `等待 ${kindLabel} 任务 · ${count}`;
+}
+
+function externalSessionFact(session) {
+  return `PID ${session.pid} · ${externalSessionLabel(session)}`;
 }
 
 function externalCanContinue(session) {
@@ -129,7 +149,7 @@ async function refreshExternalSessionStatus() {
     if (!session.projectId) continue;
     const state = session.operationalState || session.terminal?.state || 'STATE_UNCERTAIN';
     const fact = document.querySelector(`[data-session-project="${CSS.escape(session.projectId)}"]`);
-    if (fact) fact.textContent = `PID ${session.pid} · ${state}`;
+    if (fact) fact.textContent = externalSessionFact(session);
     const progress = document.querySelector(`[data-heartbeat-project="${CSS.escape(session.projectId)}"]`);
     if (progress) progress.textContent = heartbeatLabel(session.heartbeat);
     const button = document.querySelector(`[data-continue-external="${CSS.escape(session.projectId)}"]`);
@@ -382,10 +402,15 @@ function render(
       const processSession = externalSessionStates.find((session) => session.projectId === project.id)
         || project.sessions?.[0];
       const sessionStatus = live?.status || (processSession
-        ? `PID ${processSession.pid} · ${processSession.operationalState || processSession.terminal?.state || 'STATE_UNCERTAIN'}` : '未运行');
+        ? externalSessionFact(processSession) : '未运行');
       const nextAction = liveField(state, 'Next action') || liveField(state, '下一行动') || '等待会话更新 live state';
       const progress = projectProgress.find((item) => item.targetId === project.id);
       const progressSummary = progress?.summary || `尚未完成首次五小时组合审查。当前动作：${nextAction}`;
+      const maturity = project.researchMaturity;
+      const maturityFields = maturity?.fields || {};
+      const maturityText = maturity?.status === 'missing'
+        ? '尚未记录双轨成熟度'
+        : `${maturityFields.scientific_stage || 'unknown'} / ${maturityFields.claim_stage || 'unknown'} / rival ${maturityFields.rival_health || 'unknown'}`;
       const semanticState = semanticStatus(semantic);
       return `<article class="project-card">
         <div class="project-head">
@@ -400,6 +425,7 @@ function render(
           <dt>Session</dt><dd data-session-project="${escapeHtml(project.id)}">${escapeHtml(sessionStatus)}</dd>
           <dt>有效进展</dt><dd data-heartbeat-project="${escapeHtml(project.id)}">${escapeHtml(heartbeatLabel(processSession?.heartbeat))}</dd>
           <dt>当前动作</dt><dd>${escapeHtml(nextAction)}</dd>
+          <dt>研究成熟度</dt><dd>${escapeHtml(maturityText)}</dd>
           <dt>Codex</dt><dd>${escapeHtml(semanticState.text)}</dd>
         </dl>
         <div class="project-actions">

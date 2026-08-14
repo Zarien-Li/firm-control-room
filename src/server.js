@@ -5,6 +5,7 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { auditSnapshot } from './audit.js';
 import { AutomationEngine } from './automation-engine.js';
+import { runCodexOperationalResolver } from './operational-resolver.js';
 import { BrokerClient } from './broker-client.js';
 import { readClaudeHistoryHeartbeat, readRecentClaudeActivity } from './claude-history.js';
 import { collectClaudeSessions, collectSnapshot } from './collectors.js';
@@ -94,9 +95,9 @@ function externalContinuationPrompt() {
     '[FIRM USER-APPROVED CONTINUATION]',
     '继续自主推进当前已锁定研究目标。以当前可信证据和最新 active research skills 为依据，在同一 turn 内连续完成一组相互连贯的高价值动作；每完成一个常规动作后重新判断并继续下一个独立动作。',
     'GPU 尚未 compute-ready 时，继续完成所有可并行的 CPU、代码、数据、解释和 baseline 工作。',
-    '所有未来 GPU 作业必须先准备 compute-ready 的远端 command 文件，再调用 FIRM 仓库中的 scripts/submit-gpu-request.sh；不得自行选择 CUDA_VISIBLE_DEVICES 或通过 SSH/Docker 直接启动新 GPU worker。后续等待标记必须使用提交工具返回的规范 RUN_ID。',
+    '所有未来 GPU 作业必须先准备 compute-ready 的远端 command 文件，再调用 FIRM 安装目录中的 scripts/submit-gpu-request.sh；不得自行选择 CUDA_VISIBLE_DEVICES 或通过 SSH/Docker 直接启动新 GPU worker。后续等待标记必须使用提交工具返回的规范 RUN_ID。',
     '所有本地 CPU、远端 CPU、SSH 和其他长任务必须通过 scripts/run-registered-job.sh 启动，或通过 /api/jobs 显式注册和更新；不得让 FIRM 猜测进程状态。',
-    '只有在所有独立工作都完成、且唯一阻塞是 Registry 中仍为 pending/running 的任务时，才以精确机器标记 [FIRM WAITING_FOR_JOB run_id=<active_run_id>] 结束；GPU 旧标记仍兼容，但不得为已失败、已完成、缺失或仅计划中的请求输出等待标记。',
+    '只有在所有独立工作都完成、且唯一阻塞是 Registry 中仍为 pending/running 的任务时，才以精确机器标记 [FIRM WAITING_FOR_JOB run_id=<active_run_id>] 结束。这是唯一受支持的等待标记；不得为已失败、已完成、缺失或仅计划中的请求输出等待标记。',
     '不要因为完成一次实验、状态记录、请求包、代码修复或证据读取就结束本 turn；不要扩大 sealed arena，不把候选失败改写成 analysis-paper identity，不要返回常规菜单。',
     '仅在真实权限、不可逆操作、异常资源请求或必须由 PI 决定的科学歧义时暂停。',
   ].join('\n');
@@ -177,6 +178,9 @@ export async function createApp(overrides = {}) {
   const externalSessionChoiceDismisser = suppliedExternalSessionChoiceDismisser || ((session) => (
     dismissItermChoice(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
   ));
+  const operationalResolver = (project, session, jobs) => (
+    runCodexOperationalResolver({ config, project, session, jobs })
+  );
   const stopReviewInFlight = new Map();
   const jobRegistry = new JobRegistry({ store });
   const automationEngine = suppliedAutomationEngine || new AutomationEngine({
@@ -188,6 +192,7 @@ export async function createApp(overrides = {}) {
     externalSessionSubmit: externalSessionSubmitter,
     externalSessionClear: externalSessionClearer,
     externalSessionDismissChoice: externalSessionChoiceDismisser,
+    operationalResolver,
     // A normal Claude input prompt is a liveness event, not a scientific review
     // event. Project sessions own milestone Codex calls; portfolio review is
     // handled separately from the Goal Loop.
@@ -572,6 +577,11 @@ export async function createApp(overrides = {}) {
           managedSessions: true,
           codexAuditEnabled: config.codexAuditEnabled,
           codexAvailable: Boolean(config.codexExecutable),
+          sessionResolver: {
+            enabled: config.operationalResolver?.enabled === true,
+            available: Boolean(config.codexExecutable),
+            mode: 'event-driven-codex',
+          },
           reanchorMode: config.reanchorMode,
           automation: {
             gpuQueueEnabled: config.gpuQueue.enabled,
@@ -629,10 +639,14 @@ export async function createApp(overrides = {}) {
             const recentGoal = session.projectId
               ? store.recentGoalActions(session.projectId, since)
               : { count: 0 };
+            const storedGoalPolicy = policies.get(session.projectId);
+            const effectiveGoalPolicy = config.goalLoop?.enabled === true
+              && storedGoalPolicy?.enabled === true
+              ? storedGoalPolicy : null;
             const operational = deriveOperationalState(session, {
               events,
               outbox,
-              goalPolicy: policies.get(session.projectId),
+              goalPolicy: effectiveGoalPolicy,
               goalBudgetReached: recentGoal.count >= config.goalLoop.maxContinuesPerDay,
               schedulerMonitor: automationEngine.monitorSnapshot?.(),
               jobs: automationEngine.jobsSnapshot?.() || jobRegistry.snapshot(),
@@ -647,6 +661,7 @@ export async function createApp(overrides = {}) {
               heartbeat: session.heartbeat || null,
               operationalState: operational.state,
               operationalReason: operational.reason,
+              operationalDetails: operational.details,
             };
           }),
         });

@@ -80,6 +80,29 @@ export async function loadConfig() {
   } catch {
     // Local session management remains usable when SSH is unavailable.
   }
+  const operationalResolverEnabled = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_OPERATIONAL_RESOLVER_ENABLED ?? 'true'),
+  );
+  const operationalResolverTimeoutMs = Number(
+    process.env.FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS ?? 2 * 60 * 1000,
+  );
+  const operationalMessageCooldownMs = Number(
+    process.env.FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS ?? 5 * 60 * 1000,
+  );
+  const operationalMaxMessagesPerHour = Number(
+    process.env.FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR ?? 3,
+  );
+  if (!Number.isFinite(operationalResolverTimeoutMs) || operationalResolverTimeoutMs < 1000) {
+    throw new Error('FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS must be at least 1000');
+  }
+  if (!Number.isFinite(operationalMessageCooldownMs)
+      || operationalMessageCooldownMs < 60 * 1000) {
+    throw new Error('FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS must be at least 60000');
+  }
+  if (!Number.isSafeInteger(operationalMaxMessagesPerHour)
+      || operationalMaxMessagesPerHour < 1 || operationalMaxMessagesPerHour > 12) {
+    throw new Error('FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR must be an integer from 1 to 12');
+  }
   const codexAuditEnabled = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_CODEX_AUDIT_ENABLED ?? 'true'),
   );
@@ -214,6 +237,13 @@ export async function loadConfig() {
     claudeExecutable,
     claudeArgs,
     codexExecutable,
+    operationalResolver: {
+      enabled: operationalResolverEnabled,
+      timeoutMs: operationalResolverTimeoutMs,
+      cooldownMs: operationalMessageCooldownMs,
+      maxMessagesPerHour: operationalMaxMessagesPerHour,
+      schemaPath: join(ROOT, 'config', 'operational-resolver.schema.json'),
+    },
     codexAuditEnabled,
     codexAuditTimeoutMs,
     codexAuditLookbackMs,

@@ -60,15 +60,18 @@ export function deriveOperationalState(session, {
     return state(
       'WAITING_FOR_JOB',
       `Waiting for active registered job${jobWait.matchedRunIds.length > 1 ? 's' : ''}: ${jobWait.matchedRunIds.join(', ')}.`,
+      {
+        declaredRunIds: jobWait.declaredRunIds,
+        matchedJobs: jobWait.matchedJobs.map(compactJob),
+        staleDeclaredRunIds: [
+          ...jobWait.terminalDeclaredRunIds,
+          ...jobWait.missingDeclaredRunIds,
+          ...jobWait.foreignDeclaredRunIds,
+        ],
+      },
     );
   }
   const authoritativeActive = activeJobs(jobs, targetId);
-  if (terminalState === 'WAITING_INPUT' && authoritativeActive.length > 0) {
-    return state(
-      'JOB_ACTIVE_UNDECLARED',
-      `Authoritative registered job${authoritativeActive.length > 1 ? 's are' : ' is'} active, but Claude did not emit the exact wait marker: ${authoritativeActive.map((item) => item.runId).join(', ')}. Keep healthy work silent and suppress scientific review or generic continuation.`,
-    );
-  }
   if (heartbeat?.constructionLease?.active) {
     return state(
       'CONSTRUCTION_ACTIVE',
@@ -81,7 +84,7 @@ export function deriveOperationalState(session, {
   if (activeEvents.some((event) => REVIEW_EVENT_TYPES.has(event.eventType))) {
     return state('WAITING_REVIEW', 'A stop or liveness episode is awaiting independent review.');
   }
-  if (goalBudgetReached && terminalState === 'WAITING_INPUT') {
+  if (goalPolicy?.enabled && goalBudgetReached && terminalState === 'WAITING_INPUT') {
     return state('POLICY_HELD', 'Automatic continuation is held by the configured token budget.');
   }
   if (session.controlId === 'GPU_SCHEDULER' && terminalState === 'WAITING_INPUT'
@@ -93,9 +96,17 @@ export function deriveOperationalState(session, {
     return state('TOOL_DRAINING', 'The prompt is visible while descendant tools are still present.');
   }
   if (terminalState === 'WAITING_INPUT') {
+    const details = {
+      undeclaredActiveJobs: authoritativeActive.map(compactJob),
+      staleDeclaredRunIds: [
+        ...jobWait.terminalDeclaredRunIds,
+        ...jobWait.missingDeclaredRunIds,
+        ...jobWait.foreignDeclaredRunIds,
+      ],
+    };
     return goalPolicy?.enabled
-      ? state('READY_FOR_CONTINUATION', 'Claude is at a verified input prompt under an active goal policy.')
-      : state('READY_FOR_INPUT', 'Claude is at a verified input prompt.');
+      ? state('READY_FOR_CONTINUATION', 'Claude is at a verified input prompt under an active goal policy.', details)
+      : state('READY_FOR_INPUT', 'Claude is at a verified input prompt.', details);
   }
   if (terminalState === 'WORKING' && Number(heartbeat?.activeToolProcessCount || 0) > 0) {
     return state('TOOL_RUNNING', 'Claude has an active descendant tool process.');
@@ -106,8 +117,17 @@ export function deriveOperationalState(session, {
   return state('STATE_UNCERTAIN', 'Available evidence does not prove a safe operational state.');
 }
 
-function state(name, reason) {
-  return { state: name, reason };
+function compactJob(job) {
+  return {
+    runId: job.runId,
+    kind: job.kind,
+    state: job.state,
+    purpose: job.purpose || null,
+  };
+}
+
+function state(name, reason, details = null) {
+  return { state: name, reason, details };
 }
 
 export const sessionStateInternals = Object.freeze({ REVIEW_EVENT_TYPES });

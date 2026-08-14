@@ -92,17 +92,22 @@ test('global Goal Loop disable overrides persisted per-project policies', async 
   });
 });
 
-test('routine questions are self-resolved without enabling Goal Loop or repeating objectives', async () => {
+test('AI session resolver answers a stopped Claude episode exactly once', async () => {
   await fixture(async (store) => {
-    store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Sensitive full objective.' });
     const disabled = config();
     disabled.goalLoop.enabled = false;
+    disabled.watchdog.stopReviewStableMs = 0;
+    disabled.operationalResolver = { cooldownMs: 60_000, maxMessagesPerHour: 3 };
     const sent = [];
+    let resolverCalls = 0;
     const session = {
       pid: 110, projectId: 'ACL_1', tty: '/dev/ttys110',
-      terminal: { state: 'WAITING_INPUT', tailHash: 'ordinary-question' },
+      terminal: {
+        state: 'WAITING_INPUT', tailHash: 'ordinary-question',
+        terminalEvidence: 'The baseline is ready. Should I run the matched component comparison next?',
+      },
       heartbeat: {
-        historyCursor: 's:1:a', deliveryMarkers: [],
+        historyCursor: 's:1:a', episodeId: 'episode-a', deliveryMarkers: [],
         latestAssistantAt: '2026-08-11T00:00:00Z',
         latestAssistantText: 'The baseline is ready. Should I run the matched component comparison next?',
       },
@@ -111,40 +116,112 @@ test('routine questions are self-resolved without enabling Goal Loop or repeatin
       config: disabled, store, sessionManager: new FakeSessions([]),
       discoverExternalSessions: async () => ({ items: [session] }),
       externalSessionInput: async (_session, message) => sent.push(message),
+      operationalResolver: async () => {
+        resolverCalls += 1;
+        return {
+          status: 'completed', resolution: {
+            shouldSend: true,
+            message: '运行 matched component comparison，并配对记录 utility。',
+            confidence: 0.94, evidenceSource: 'session:latest-assistant',
+            evidenceQuote: 'Should I run the matched component comparison next?',
+            rationale: 'This is the next evidence-bearing action.', recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
     });
     await engine.cycle();
     await engine.cycle();
+    assert.equal(resolverCalls, 1);
     assert.equal(sent.length, 1);
-    assert.match(sent[0], /ROUTINE-QUESTION RESPONSE/);
-    assert.doesNotMatch(sent[0], /Sensitive full objective/);
+    assert.match(sent[0], /matched component comparison/);
     assert.equal(store.listAutomationEvents(20).some((item) => (
-      item.eventType === 'ROUTINE_QUESTION_RETURNED_TO_CLAUDE'
+      item.eventType === 'AI_SESSION_MESSAGE_SENT'
     )), true);
     assert.equal(store.listAutomationEvents(20).some((item) => item.eventType === 'GOAL_CONTINUED'), false);
   });
 });
 
-test('human-owned questions remain untouched', async () => {
+test('AI session resolver can keep a stopped episode silent without a hard-coded wait category', async () => {
   await fixture(async (store) => {
     const disabled = config();
     disabled.goalLoop.enabled = false;
+    disabled.watchdog.stopReviewStableMs = 0;
     const sent = [];
+    let resolverCalls = 0;
     const session = {
       pid: 111, projectId: 'ACL_1', tty: '/dev/ttys111',
-      terminal: { state: 'WAITING_INPUT', tailHash: 'permission-question' },
+      terminal: { state: 'WAITING_INPUT', tailHash: 'registered-wait' },
       heartbeat: {
-        historyCursor: 's:1:a', deliveryMarkers: [],
+        historyCursor: 's:1:a', episodeId: 'episode-wait', deliveryMarkers: [],
         latestAssistantAt: '2026-08-11T00:00:00Z',
-        latestAssistantText: 'May I delete the dataset and change the paper contribution type?',
+        latestAssistantText: 'The registered training run is active; waiting for its result.',
       },
     };
     const engine = new AutomationEngine({
       config: disabled, store, sessionManager: new FakeSessions([]),
       discoverExternalSessions: async () => ({ items: [session] }),
       externalSessionInput: async (_session, message) => sent.push(message),
+      operationalResolver: async () => {
+        resolverCalls += 1;
+        return {
+          status: 'completed', resolution: {
+            shouldSend: false, message: '', confidence: 0.96,
+            evidenceSource: 'session:latest-assistant',
+            evidenceQuote: 'registered training run is active',
+            rationale: 'No response is useful while the declared work is active.',
+            recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
+    });
+    await engine.cycle();
+    assert.equal(resolverCalls, 1);
+    assert.equal(sent.length, 0);
+    const decision = store.listAutomationEvents(20)
+      .find((item) => item.eventType === 'AI_SESSION_DECISION');
+    assert.equal(decision.source.shouldSend, false);
+  });
+});
+
+test('AI response is discarded when Claude advances while Codex is deciding', async () => {
+  await fixture(async (store) => {
+    const localConfig = config();
+    localConfig.watchdog.stopReviewStableMs = 0;
+    localConfig.operationalResolver = { cooldownMs: 60_000, maxMessagesPerHour: 3 };
+    const sent = [];
+    const session = {
+      pid: 112, projectId: 'ACL_1', tty: '/dev/ttys112',
+      terminal: { state: 'WAITING_INPUT', tailHash: 'old-stop' },
+      heartbeat: {
+        historyCursor: 's:old', episodeId: 'old-episode', deliveryMarkers: [],
+        latestAssistantText: 'Should I continue the current comparison?',
+      },
+    };
+    const engine = new AutomationEngine({
+      config: localConfig, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_target, message) => sent.push(message),
+      operationalResolver: async () => {
+        session.terminal = { state: 'WORKING', tailHash: 'new-work' };
+        session.heartbeat = { ...session.heartbeat, episodeId: 'new-episode', historyCursor: 's:new' };
+        return {
+          status: 'completed', resolution: {
+            shouldSend: true, message: 'Continue the old action.', confidence: 0.95,
+            evidenceSource: 'session:latest-assistant',
+            evidenceQuote: 'continue the current comparison',
+            rationale: 'The old stop requested a decision.', recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
     });
     await engine.cycle();
     assert.equal(sent.length, 0);
+    assert.equal(store.listAutomationEvents(20).some((item) => (
+      item.eventType === 'AI_SESSION_RESPONSE_STALE'
+    )), true);
   });
 });
 
@@ -1351,33 +1428,52 @@ test('an acknowledged marker still visible in the editor is cleared, never resub
   });
 });
 
-test('Claude routine recommendation is confirmed once and verified by foreground advance', async () => {
+test('AI session resolver handles a Claude choice without a hard-coded option policy', async () => {
   await fixture(async (store) => {
-    const submitted = [];
+    const dismissed = [];
+    const sent = [];
+    const localConfig = config();
+    localConfig.watchdog.stopReviewStableMs = 0;
+    localConfig.operationalResolver = { cooldownMs: 60_000, maxMessagesPerHour: 3 };
     const session = {
       pid: 109, projectId: 'ACL_1', tty: '/dev/ttys109',
       terminal: {
         state: 'ROUTINE_CHOICE', tailHash: 'choice-a', recommendedSelected: true,
         selectedOptionNumber: 1, selectedOptionText: 'Run the queued baseline.',
       },
-      heartbeat: { historyCursor: 's:1', deliveryMarkers: [] },
+      heartbeat: {
+        historyCursor: 's:1', episodeId: 'choice-episode', deliveryMarkers: [],
+        latestAssistantText: 'Choose between running the baseline or opening a new method.',
+      },
     };
     const engine = new AutomationEngine({
-      config: config(), store, sessionManager: new FakeSessions([]),
+      config: localConfig, store, sessionManager: new FakeSessions([]),
       discoverExternalSessions: async () => ({ items: [session] }),
-      externalSessionSubmit: async (target) => submitted.push(target.tty),
+      externalSessionDismissChoice: async (target) => dismissed.push(target.tty),
+      externalSessionInput: async (_target, message) => sent.push(message),
+      operationalResolver: async () => ({
+        status: 'completed', resolution: {
+          shouldSend: true, message: '选择并运行已队列的强 baseline，不要开新方法。',
+          confidence: 0.95, evidenceSource: 'session:latest-assistant',
+          evidenceQuote: 'running the baseline or opening a new method',
+          rationale: 'The incumbent comparison is prerequisite evidence.',
+          recheckAfterSeconds: 0, grounding: { grounded: true, eligible: true },
+        },
+      }),
     });
     await engine.cycle();
     await engine.cycle();
-    assert.deepEqual(submitted, ['/dev/ttys109']);
+    assert.deepEqual(dismissed, ['/dev/ttys109']);
+    assert.equal(sent.length, 1);
+    assert.match(sent[0], /强 baseline/);
     const event = store.listAutomationEvents(100).find((item) => (
-      item.eventType === 'ROUTINE_RECOMMENDATION_ACCEPTED'
+      item.eventType === 'AI_SESSION_MESSAGE_SENT'
     ));
-    assert.equal(event.status, 'SENT');
+    assert.ok(event);
     session.terminal = { state: 'WORKING', tailHash: 'work-b' };
     session.heartbeat = { historyCursor: 's:2', deliveryMarkers: [] };
     await engine.cycle();
-    assert.equal(store.getAutomationEvent(event.eventKey).status, 'RESOLVED');
+    assert.equal(sent.length, 1);
   });
 });
 
@@ -1508,18 +1604,23 @@ test('durable assistant and progress evidence resolves stale watchdog events aft
   });
 });
 
-test('a verified registered-job wait suppresses stop review and Goal Loop until terminal', async () => {
+test('AI resolver inspects a registered-job wait, stays silent, and terminal result still wakes Claude', async () => {
   await fixture(async (store) => {
     store.setAutomationPolicy('ACL_1', { enabled: true, objective: 'Finish ACL_1.' });
     let now = new Date('2026-08-11T00:00:00Z');
     let queueState = 'running';
     const sent = [];
-    const stopped = [];
+    let resolverCalls = 0;
+    let resolverJobs = [];
     const session = {
       pid: 102, projectId: 'ACL_1', tty: '/dev/ttys102',
-      terminal: { state: 'WAITING_INPUT', tailHash: 'gpu-wait-tail' },
+      terminal: {
+        state: 'WAITING_INPUT', tailHash: 'gpu-wait-tail',
+        terminalEvidence: 'Waiting for registered run ACL_1_train_1.',
+      },
       heartbeat: {
-        historyCursor: 's:gpu-wait', deliveryMarkers: [],
+        historyCursor: 's:gpu-wait', episodeId: 'gpu-wait-episode', deliveryMarkers: [],
+        latestAssistantText: 'Waiting for registered run ACL_1_train_1.',
         waitingForJobRunIds: ['ACL_1_train_1'],
       },
     };
@@ -1540,16 +1641,28 @@ test('a verified registered-job wait suppresses stop review and Goal Loop until 
       config: config(), store, sessionManager: new FakeSessions([]), queueCollector,
       discoverExternalSessions: async () => ({ items: [session] }),
       externalSessionInput: async (_session, message) => sent.push(message),
-      onExternalSessionStopped: async (stop) => stopped.push(stop),
+      operationalResolver: async (_project, _session, jobs) => {
+        resolverCalls += 1;
+        resolverJobs = jobs;
+        return {
+          status: 'completed', resolution: {
+            shouldSend: false, message: '', confidence: 0.99,
+            evidenceSource: 'session:latest-assistant',
+            evidenceQuote: 'registered run ACL_1_train_1',
+            rationale: 'The registered run is active.', recheckAfterSeconds: 0,
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
       now: () => now,
     });
     await engine.cycle({ forceQueue: true });
     now = new Date('2026-08-11T00:00:20Z');
     await engine.cycle({ forceQueue: true });
     assert.equal(sent.length, 0);
-    assert.equal(stopped.length, 0);
-    assert.equal(store.listAutomationEvents(100).some((item) => (
-      item.eventType === 'JOB_WAIT_ACCEPTED'
+    assert.equal(resolverCalls, 1);
+    assert.equal(resolverJobs.some((job) => (
+      job.runId === 'ACL_1_train_1' && job.state === 'running'
     )), true);
 
     queueState = 'done';

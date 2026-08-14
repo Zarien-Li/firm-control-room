@@ -117,6 +117,13 @@ function appleScriptArgs(lines, argv) {
   return [...lines.flatMap((line) => ['-e', line]), '--', ...argv];
 }
 
+function terminalEpisodeEvidence(value) {
+  const recent = String(value || '').replace(/\r/g, '').slice(-12000);
+  const statusIndex = recent.lastIndexOf('\n  ⏵⏵');
+  const end = statusIndex >= 0 ? statusIndex : recent.length;
+  return recent.slice(Math.max(0, end - 3000), end).trim();
+}
+
 async function runAppleScript(lines, argv) {
   const { stdout } = await exec('/usr/bin/osascript', appleScriptArgs(lines, argv), {
     timeout: 10_000,
@@ -185,10 +192,17 @@ export function classifyItermTail(value, options = {}) {
     const selectedBlock = (nextOption >= 0 ? following.slice(0, nextOption + 1) : following).trim();
     const selectedText = selectedBlock.replace(/^❯\s*\d+\.\s*/u, '').replace(/\s+/g, ' ').trim();
     const humanOwned = /\b(?:grant|authorize|permission|approve|withdraw|submit|purchase|delete|archive)\b|\b(?:paper identity|contribution type|new seed|venue change)\b|(?:授权|批准|许可|删除|归档|投稿|撤稿|付费|更换\s*seed|贡献类型|论文身份)/i.test(selectedText);
-    if (confirmationIndex >= 0 || humanOwned) {
+    if (confirmationIndex >= 0) {
       return {
-        state: 'CONFIRMATION', reason: 'human_owned_choice_visible',
+        state: 'CONFIRMATION', reason: 'interactive_confirmation_visible',
         selectedOptionNumber: Number(selectedChoice[1]), selectedOptionText: selectedText.slice(0, 500),
+      };
+    }
+    if (humanOwned) {
+      return {
+        state: 'BOUNDARY_CHOICE', reason: 'claimed_human_boundary_choice_visible',
+        selectedOptionNumber: Number(selectedChoice[1]), selectedOptionText: selectedText.slice(0, 500),
+        recommendedSelected: /\(Recommended\)|（推荐）|推荐选项/i.test(selectedBlock),
       };
     }
     return {
@@ -216,7 +230,11 @@ export function classifyItermTail(value, options = {}) {
   const foregroundProgress = progressIndex > statusIndex;
   const promptIsForeground = promptIndex >= 0 && statusIndex > promptEnd && !foregroundProgress;
   const queuedInputVisible = /Press up to edit queued/i.test(`${statusText}\n${promptText}`);
-  const modelWorking = /esc to interrupt/i.test(statusText) || progressIndex > promptIndex;
+  // Claude keeps an editable prompt visible while a turn is running. Narrow
+  // terminals truncate the authoritative footer to `esc to int…`, so requiring
+  // the full word incorrectly turns live work into WAITING_INPUT.
+  const modelWorking = /esc to (?:int(?:errupt)?(?:…|\.{3})?|…|\.{3})/i.test(statusText)
+    || progressIndex > promptIndex;
   if (promptIsForeground) {
     if (queuedInputVisible) {
       return {
@@ -289,6 +307,7 @@ export async function collectItermStatuses(options = {}) {
         tty: item.tty,
         name: String(item.name || '').slice(0, 200),
         ...classifyItermTail(item.tail, { now: options.now }),
+        terminalEvidence: terminalEpisodeEvidence(item.tail),
         tailHash: createHash('sha256').update(String(item.tail || '')).digest('hex'),
       })),
     };
