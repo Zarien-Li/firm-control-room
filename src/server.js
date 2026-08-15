@@ -156,7 +156,11 @@ export async function createApp(overrides = {}) {
         || ['CLAUDE-RESEARCH.md', project.bootstrapFile || 'prompt.txt'],
     }));
   }
-  const store = await createStore(config.dataDir);
+  const store = await createStore(config.dataDir, {
+    scanRetention: config.historyRetention?.scans,
+    gpuSnapshotRetention: config.historyRetention?.gpuSnapshots,
+  });
+  store.pruneHistory();
   const sessionManager = suppliedSessionManager
     || suppliedBrokerClient
     || new BrokerClient({ socketPath: config.brokerSocketPath });

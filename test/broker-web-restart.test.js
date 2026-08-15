@@ -100,3 +100,26 @@ test('real Web restart keeps the broker session id and PID and WebSocket resumes
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('broker survives a client timeout followed by a late response', async () => {
+  const root = await mkdtemp(join(tmpdir(), 'firm-broker-timeout-'));
+  const socketPath = join(root, 'broker.sock');
+  const manager = {
+    async list() {
+      await new Promise((resolve) => setTimeout(resolve, 75));
+      return [];
+    },
+    async close() {},
+  };
+  const broker = await createBrokerServer({ socketPath, manager });
+  try {
+    const impatient = new BrokerClient({ socketPath, timeoutMs: 5 });
+    await assert.rejects(impatient.list(), { code: 'broker_timeout' });
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    const healthy = new BrokerClient({ socketPath, timeoutMs: 1000 });
+    assert.equal((await healthy.health()).ok, true);
+  } finally {
+    await broker.close();
+    await rm(root, { recursive: true, force: true });
+  }
+});

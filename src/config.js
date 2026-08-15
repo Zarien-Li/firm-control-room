@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -240,11 +240,23 @@ export async function loadConfig() {
     ...controlTargets,
   ];
   const dataDir = resolve(process.env.FIRM_DATA_DIR || join(ROOT, 'var'));
+  const scanRetention = Number(process.env.FIRM_SCAN_RETENTION ?? 50);
+  const gpuSnapshotRetention = Number(process.env.FIRM_GPU_SNAPSHOT_RETENTION ?? 200);
+  if (!Number.isSafeInteger(scanRetention) || scanRetention < 10) {
+    throw new Error('FIRM_SCAN_RETENTION must be an integer of at least 10');
+  }
+  if (!Number.isSafeInteger(gpuSnapshotRetention) || gpuSnapshotRetention < 20) {
+    throw new Error('FIRM_GPU_SNAPSHOT_RETENTION must be an integer of at least 20');
+  }
+  const brokerAutoStart = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_BROKER_AUTOSTART ?? 'true'),
+  );
   return {
     root: ROOT,
     configPath,
     projects,
     dataDir,
+    historyRetention: { scans: scanRetention, gpuSnapshots: gpuSnapshotRetention },
     host: process.env.FIRM_HOST || '127.0.0.1',
     port: Number(process.env.FIRM_PORT || 8787),
     scanIntervalMs,
@@ -310,7 +322,8 @@ export async function loadConfig() {
     sessionBufferBytes,
     brokerSocketPath: resolve(
       process.env.FIRM_BROKER_SOCKET
-        || join(tmpdir(), `firm-control-room-${process.getuid?.() ?? 'user'}.sock`),
+        || join(dataDir, 'control-plane', 'broker.sock'),
     ),
+    brokerAutoStart,
   };
 }

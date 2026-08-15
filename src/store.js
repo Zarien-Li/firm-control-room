@@ -2,13 +2,18 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export async function createStore(dataDir) {
+export async function createStore(dataDir, options = {}) {
   await mkdir(dataDir, { recursive: true });
   const databasePath = join(dataDir, 'history.sqlite');
   const db = new DatabaseSync(databasePath);
+  const scanRetention = Math.max(10, Number(options.scanRetention) || 50);
+  const gpuSnapshotRetention = Math.max(20, Number(options.gpuSnapshotRetention) || 200);
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA wal_autocheckpoint = 250;
+    PRAGMA journal_size_limit = 16777216;
     CREATE TABLE IF NOT EXISTS scans (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collected_at TEXT NOT NULL,
@@ -249,6 +254,13 @@ export async function createStore(dataDir) {
     FROM scans ORDER BY id DESC LIMIT ?
   `);
   const get = db.prepare('SELECT * FROM scans WHERE id = ?');
+  const pruneScans = db.prepare(`
+    DELETE FROM scans
+    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
+      AND id NOT IN (
+        SELECT scan_id FROM semantic_audits WHERE scan_id IS NOT NULL
+      )
+  `);
   const insertSemantic = db.prepare(`
     INSERT INTO semantic_audits
       (scan_id, project_id, status, packet_hash, packet_path, result_path, audit_json, error)
@@ -303,6 +315,12 @@ export async function createStore(dataDir) {
   `);
   const latestGpuQueueSnapshot = db.prepare(`
     SELECT * FROM gpu_queue_snapshots ORDER BY id DESC LIMIT 1
+  `);
+  const pruneGpuQueueSnapshots = db.prepare(`
+    DELETE FROM gpu_queue_snapshots
+    WHERE id NOT IN (
+      SELECT id FROM gpu_queue_snapshots ORDER BY id DESC LIMIT ?
+    )
   `);
   const insertAutomationEvent = db.prepare(`
     INSERT OR IGNORE INTO automation_events
@@ -617,6 +635,7 @@ export async function createStore(dataDir) {
         evidence.bundleHash,
         evidence.directory,
       );
+      pruneScans.run(scanRetention);
       return Number(result.lastInsertRowid);
     },
     list(limit = 50) {
@@ -718,6 +737,7 @@ export async function createStore(dataDir) {
         snapshot.status,
         JSON.stringify(snapshot),
       );
+      pruneGpuQueueSnapshots.run(gpuSnapshotRetention);
       return Number(inserted.lastInsertRowid);
     },
     latestGpuQueueSnapshot() {
@@ -729,6 +749,15 @@ export async function createStore(dataDir) {
         createdAt: row.created_at,
         status: row.status,
         snapshot: JSON.parse(row.snapshot_json),
+      };
+    },
+    pruneHistory() {
+      const scans = pruneScans.run(scanRetention);
+      const gpuSnapshots = pruneGpuQueueSnapshots.run(gpuSnapshotRetention);
+      db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+      return {
+        scansDeleted: Number(scans.changes),
+        gpuSnapshotsDeleted: Number(gpuSnapshots.changes),
       };
     },
     createAutomationEvent(event) {
