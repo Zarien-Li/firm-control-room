@@ -99,7 +99,7 @@ function automationPrompt(event) {
 
 function goalPrompt(policy) {
   return [
-    '[FIRM USER-APPROVED CONTINUATION RESPONSE]',
+    '[FIRM RESEARCH CONTINUATION RESPONSE]',
     'Resolve only the ordinary question or option in your immediately preceding message from evidence already present. Stay inside the current construction episode; do not begin a new method, call Codex, or restate the project objective because of this response.',
   ].join('\n');
 }
@@ -582,10 +582,19 @@ export class AutomationEngine {
   async #resolveStoppedSession(session, candidate) {
     const project = this.config.projects.find((item) => item.id === session.projectId);
     if (!project) return { done: true };
+    const reconciliationEvents = this.store.listPendingAutomationEvents(1000).filter((event) => (
+      event.targetId === session.projectId
+      && event.eventType === 'AI_STATE_RECONCILIATION_REQUIRED'
+    ));
+    const reconciliationObligations = reconciliationEvents.map((event) => ({
+      key: event.eventKey,
+      expectation: event.source?.expectation || event.message,
+      createdAt: event.createdAt,
+    }));
     if (!candidate.operationalResult) {
       try {
         candidate.operationalResult = await this.operationalResolver(
-          project, session, this.jobsSnapshot().items || [],
+          project, session, this.jobsSnapshot().items || [], reconciliationObligations,
         );
       } catch (error) {
         candidate.operationalResult = { status: 'failed', error: String(error.message || error) };
@@ -595,18 +604,20 @@ export class AutomationEngine {
     const resolution = result?.resolution;
     const identity = candidate.stop.episodeId || candidate.stop.tailHash;
     const resolutionKey = `operational-resolution:${session.projectId}:${session.pid}:${identity}`;
+    const failureKey = `operational-resolution-failure:${session.projectId}:${session.pid}:${identity}`;
     if (result?.status !== 'completed' || !resolution?.grounding?.eligible) {
       this.store.createAutomationEvent({
-        eventKey: resolutionKey,
+        eventKey: failureKey,
         category: 'session_control', eventType: 'AI_SESSION_RESOLUTION_WITHHELD',
-        targetId: session.projectId, severity: 'warn', status: 'RESOLVED',
-        title: `AI session response withheld: ${session.projectId}`,
-        message: 'Codex could not produce a sufficiently grounded response for this stopped episode, so FIRM sent nothing.',
+        targetId: session.projectId, severity: 'warn', status: 'PENDING',
+        title: `Research resolver recovery pending: ${session.projectId}`,
+        message: 'The research resolver could not yet produce a grounded response. This stopped episode remains open and will be retried automatically.',
         source: { deliveryPolicy: 'none', pid: session.pid, resolverStatus: result?.status || 'unknown' },
         note: String(result?.error || 'ungrounded_operational_resolution').slice(0, 500),
       });
       const requestedRetrySeconds = Number(resolution?.recheckAfterSeconds || 0);
-      if (result?.status !== 'completed' || requestedRetrySeconds > 0) {
+      if (result?.status !== 'completed' || requestedRetrySeconds > 0
+          || reconciliationObligations.length > 0) {
         candidate.operationalResult = null;
         candidate.resolverAttempts = Number(candidate.resolverAttempts || 0) + 1;
         const retryMs = requestedRetrySeconds > 0
@@ -615,6 +626,21 @@ export class AutomationEngine {
         return { done: false, deferUntil: this.now().getTime() + retryMs };
       }
       return { done: true };
+    }
+    const pendingFailure = this.store.getAutomationEvent(failureKey);
+    if (pendingFailure && ['PENDING', 'HELD', 'SENT'].includes(pendingFailure.status)) {
+      this.store.setAutomationEvent(pendingFailure.id, {
+        status: 'RESOLVED', note: `resolver_recovered:${identity}`,
+      });
+    }
+    for (const key of resolution.fulfilledReconciliationKeys || []) {
+      const fulfilled = reconciliationEvents.find((event) => event.eventKey === key);
+      if (fulfilled) {
+        this.store.setAutomationEvent(fulfilled.id, {
+          status: 'RESOLVED',
+          note: `verified_by_operational_resolver:${identity}`,
+        });
+      }
     }
     this.store.createAutomationEvent({
       eventKey: resolutionKey,
@@ -720,6 +746,24 @@ export class AutomationEngine {
       event, session: currentSession, prompt: resolution.message,
       note: 'codex_autonomous_session_response',
     });
+    if (delivery.status !== 'failed' && resolution.stateReconciliation) {
+      this.store.createAutomationEvent({
+        eventKey: `${resolutionKey}:state-reconciliation`,
+        category: 'session_control',
+        eventType: 'AI_STATE_RECONCILIATION_REQUIRED',
+        targetId: session.projectId,
+        severity: 'info',
+        status: 'PENDING',
+        title: `AI state reconciliation required: ${session.projectId}`,
+        message: resolution.stateReconciliation,
+        source: {
+          deliveryPolicy: 'none',
+          pid: session.pid,
+          expectation: resolution.stateReconciliation,
+          originResolutionKey: resolutionKey,
+        },
+      });
+    }
     return { done: delivery.status !== 'failed' };
   }
 

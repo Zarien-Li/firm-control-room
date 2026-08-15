@@ -203,11 +203,22 @@ test('external iTerm API reports pause state and sends only the fixed continuati
   try {
     const address = await app.listen(0, '127.0.0.1');
     const base = `http://127.0.0.1:${address.port}`;
-    let response = await fetch(`${base}/api/external-sessions`);
+    let response = await fetch(`${base}/api/jobs`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        runId: 'P_training', projectId: 'P', kind: 'gpu', state: 'running',
+        purpose: 'paired utility training',
+      }),
+    });
+    assert.equal(response.status, 201);
+    response = await fetch(`${base}/api/external-sessions`);
     const status = await response.json();
     assert.equal(status.items[0].terminal.state, 'WAITING_INPUT');
     assert.equal(status.items[0].operationalState, 'READY_FOR_INPUT');
     assert.equal(status.items[0].heartbeat.lastProgressAt, '2026-08-11T00:02:00.000Z');
+    assert.deepEqual(status.items[0].projectActiveJobs.map(({ runId, state }) => ({ runId, state })), [
+      { runId: 'P_training', state: 'running' },
+    ]);
     response = await fetch(`${base}/api/external-sessions/P/continue`, {
       method: 'POST', headers: { 'content-type': 'application/json' }, body: '{}',
     });
@@ -216,7 +227,7 @@ test('external iTerm API reports pause state and sends only the fixed continuati
     assert.equal(continuation.status, 'sent_awaiting_ack');
     assert.equal(sent.length, 1);
     assert.match(sent[0].message, /\[FIRM DELIVERY firm-[a-f0-9]{24}\]/);
-    assert.match(sent[0].message, /FIRM USER-APPROVED CONTINUATION/);
+    assert.match(sent[0].message, /FIRM RESEARCH CONTINUATION/);
     assert.match(sent[0].message, /不要扩大 sealed arena/);
   } finally {
     await app.close();

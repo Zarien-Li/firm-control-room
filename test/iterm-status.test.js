@@ -199,7 +199,7 @@ test('a truncated Claude working footer wins over the editable empty prompt', ()
   });
 });
 
-test('ordinary Claude menus are distinct from human-owned confirmations', () => {
+test('ordinary research menus are distinct from external-authorization confirmations', () => {
   assert.deepEqual(classifyItermTail([
     'How should I unblock it?',
     '❯ 1. Start the GPU Scheduler (Recommended)',
@@ -220,7 +220,7 @@ test('ordinary Claude menus are distinct from human-owned confirmations', () => 
     'Enter to select · Esc to cancel',
   ].join('\n')), {
     state: 'BOUNDARY_CHOICE',
-    reason: 'claimed_human_boundary_choice_visible',
+    reason: 'external_authorization_choice_visible',
     selectedOptionNumber: 1,
     selectedOptionText: 'Grant permission to delete the dataset (Recommended)',
     recommendedSelected: true,

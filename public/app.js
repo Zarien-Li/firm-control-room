@@ -105,7 +105,25 @@ function externalSessionLabel(session) {
     PROGRESS_STALLED: '有效进展停滞',
     STATE_UNCERTAIN: '状态不确定',
   };
-  return labels[state] || state;
+  const sessionLabel = labels[state] || state;
+  const jobLabel = activeProjectJobLabel(session?.projectActiveJobs || []);
+  if (!jobLabel) return sessionLabel;
+  if (['READY_FOR_INPUT', 'READY_FOR_CONTINUATION'].includes(state)) return jobLabel;
+  return `${sessionLabel} · ${jobLabel}`;
+}
+
+function activeProjectJobLabel(jobs) {
+  if (!jobs.length) return '';
+  const gpuRunning = jobs.filter((job) => job.kind === 'gpu' && job.state === 'running').length;
+  const gpuPending = jobs.filter((job) => job.kind === 'gpu' && job.state === 'pending').length;
+  const otherRunning = jobs.filter((job) => job.kind !== 'gpu' && job.state === 'running').length;
+  const otherPending = jobs.filter((job) => job.kind !== 'gpu' && job.state === 'pending').length;
+  return [
+    gpuRunning ? `GPU 实验运行中 · ${gpuRunning}` : '',
+    gpuPending ? `GPU 队列等待 · ${gpuPending}` : '',
+    otherRunning ? `长任务运行中 · ${otherRunning}` : '',
+    otherPending ? `长任务排队 · ${otherPending}` : '',
+  ].filter(Boolean).join(' / ');
 }
 
 function registeredWaitLabel(jobs) {

@@ -84,13 +84,19 @@ export async function loadConfig() {
     String(process.env.FIRM_OPERATIONAL_RESOLVER_ENABLED ?? 'true'),
   );
   const operationalResolverTimeoutMs = Number(
-    process.env.FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS ?? 2 * 60 * 1000,
+    process.env.FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS ?? 10 * 60 * 1000,
   );
   const operationalMessageCooldownMs = Number(
     process.env.FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS ?? 5 * 60 * 1000,
   );
   const operationalMaxMessagesPerHour = Number(
     process.env.FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR ?? 3,
+  );
+  const operationalResolverAttempts = Number(
+    process.env.FIRM_OPERATIONAL_RESOLVER_ATTEMPTS ?? 2,
+  );
+  const operationalResolverMaxConcurrency = Number(
+    process.env.FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY ?? 2,
   );
   if (!Number.isFinite(operationalResolverTimeoutMs) || operationalResolverTimeoutMs < 1000) {
     throw new Error('FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS must be at least 1000');
@@ -103,6 +109,14 @@ export async function loadConfig() {
       || operationalMaxMessagesPerHour < 1 || operationalMaxMessagesPerHour > 12) {
     throw new Error('FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR must be an integer from 1 to 12');
   }
+  if (!Number.isSafeInteger(operationalResolverAttempts)
+      || operationalResolverAttempts < 1 || operationalResolverAttempts > 4) {
+    throw new Error('FIRM_OPERATIONAL_RESOLVER_ATTEMPTS must be an integer from 1 to 4');
+  }
+  if (!Number.isSafeInteger(operationalResolverMaxConcurrency)
+      || operationalResolverMaxConcurrency < 1 || operationalResolverMaxConcurrency > 4) {
+    throw new Error('FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY must be an integer from 1 to 4');
+  }
   const codexAuditEnabled = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_CODEX_AUDIT_ENABLED ?? 'true'),
   );
@@ -114,7 +128,7 @@ export async function loadConfig() {
   if (!Number.isFinite(codexAuditLookbackMs) || codexAuditLookbackMs < 60 * 1000) {
     throw new Error('FIRM_CODEX_AUDIT_LOOKBACK_MS must be at least 60000');
   }
-  const reanchorMode = String(process.env.FIRM_REANCHOR_MODE || 'approval').toLowerCase();
+  const reanchorMode = String(process.env.FIRM_REANCHOR_MODE || 'auto').toLowerCase();
   if (!['off', 'approval', 'auto'].includes(reanchorMode)) {
     throw new Error('FIRM_REANCHOR_MODE must be off, approval, or auto');
   }
@@ -242,6 +256,8 @@ export async function loadConfig() {
       timeoutMs: operationalResolverTimeoutMs,
       cooldownMs: operationalMessageCooldownMs,
       maxMessagesPerHour: operationalMaxMessagesPerHour,
+      attempts: operationalResolverAttempts,
+      maxConcurrency: operationalResolverMaxConcurrency,
       schemaPath: join(ROOT, 'config', 'operational-resolver.schema.json'),
     },
     codexAuditEnabled,

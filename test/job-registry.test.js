@@ -40,6 +40,26 @@ test('GPU queue synchronizes into the registry but stale pending cannot regress 
   store.close();
 });
 
+test('GPU queue accepts a terminal state when a short run finishes between polls', async () => {
+  const { store, registry } = await fixture();
+  registry.syncGpuQueue({ status: 'ok', items: [{
+    runId: 'ACL_6_short', project: 'ACL_6', state: 'pending',
+    remotePath: '/queue/pending/ACL_6_short',
+  }] });
+  registry.syncGpuQueue({ status: 'ok', items: [{
+    runId: 'ACL_6_short', project: 'ACL_6', state: 'done',
+    remotePath: '/queue/done/ACL_6_short', signalAt: '2026-08-12T00:00:10Z',
+  }] });
+  const job = registry.get('ACL_6_short');
+  assert.equal(job.state, 'done');
+  assert.equal(job.result.remotePath, '/queue/done/ACL_6_short');
+  assert.equal(
+    registry.events('ACL_6_short').filter((event) => event.eventType === 'state_changed').length,
+    1,
+  );
+  store.close();
+});
+
 test('GPU queue requires two authoritative misses before failing a vanished active run', async () => {
   const { store, registry } = await fixture();
   registry.syncGpuQueue({ status: 'ok', items: [{

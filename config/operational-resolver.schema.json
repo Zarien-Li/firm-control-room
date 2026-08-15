@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "type": "object",
   "additionalProperties": false,
-  "required": ["send", "message", "confidence", "evidence_source", "evidence_quote", "rationale", "recheck_after_seconds"],
+  "required": ["send", "message", "confidence", "evidence_source", "evidence_quote", "rationale", "recheck_after_seconds", "state_reconciliation", "fulfilled_reconciliation_keys"],
   "properties": {
     "send": { "type": "boolean" },
     "message": { "type": "string", "maxLength": 4000 },
@@ -13,6 +13,12 @@
     },
     "evidence_quote": { "type": "string", "maxLength": 1200 },
     "rationale": { "type": "string", "maxLength": 1200 },
-    "recheck_after_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 }
+    "recheck_after_seconds": { "type": "integer", "minimum": 0, "maximum": 86400 },
+    "state_reconciliation": { "type": "string", "maxLength": 1200 },
+    "fulfilled_reconciliation_keys": {
+      "type": "array",
+      "maxItems": 10,
+      "items": { "type": "string", "maxLength": 200 }
+    }
   }
 }

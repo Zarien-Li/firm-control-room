@@ -29,7 +29,7 @@ export function deriveOperationalState(session, {
     return state('OBSERVABILITY_DEGRADED', 'History or terminal evidence is unavailable.');
   }
   if (terminalState === 'CONFIRMATION') {
-    return state('CONFIRMATION_REQUIRED', 'Claude is waiting for a human permission decision.');
+    return state('CONFIRMATION_REQUIRED', 'Claude is waiting at an execution-safety confirmation.');
   }
   if (terminalState === 'ROUTINE_CHOICE') {
     return state(

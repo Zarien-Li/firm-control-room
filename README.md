@@ -129,7 +129,7 @@ That distinction matters. A spinner with no history, artifact, or tool progress 
 
 ### Safe continuation
 
-Automatic Goal Loop injection is globally off by default. Each newly stopped episode is handed to the AI Session Resolver together with the current terminal episode, latest Claude response, active tools, construction lease, and registered jobs. Codex may answer a question, choose among options, recover interrupted work, schedule a recheck, or remain silent. The machine protocol contains only `send`, the exact `message`, and an optional recheck time; it has no predefined scientific or failure categories. A timeout, unavailable Codex process, low confidence, or unverifiable episode quotation fails closed and sends nothing.
+Automatic Goal Loop injection is globally off by default. Each newly stopped episode is handed to the Research Session Resolver together with the current terminal episode, latest Claude response, active tools, construction lease, registered jobs, and the persistent research-authority block from the project's `CLAUDE.md`. Codex acts as another PI: it may answer a question, choose among options, recover interrupted work, schedule a recheck, or remain silent. Research decisions are autonomous; only external-rights actions such as credentials, payment, legal commitments, irreversible deletion, formal submission, or public release require owner authorization. Resolver transport failures remain visible and retry automatically instead of becoming silently resolved events.
 
 An external iTerm message is not considered delivered merely because AppleScript pasted it. The Claude history must contain its unique `[FIRM DELIVERY ...]` marker. Uncertain sends are exposed instead of retried blindly.
 
@@ -139,7 +139,7 @@ Codex is invoked as a short-lived, read-only boundary auditor, not a permanent c
 
 For deployments that use a separate portfolio-review scheduler, set `FIRM_SCAN_INTERVAL_MS=0` and `FIRM_CODEX_AUDIT_ENABLED=false`. This leaves FIRM responsible for session liveness, structured job state, and operational events while the external scheduler remains the single owner of periodic scientific review. Manual audit endpoints remain available when explicitly enabled.
 
-The default re-anchor mode is `approval`: high-confidence, grounded interventions enter an inbox and wait for a human decision.
+The default re-anchor mode is `auto`: high-confidence, grounded interventions are delivered directly. This does not grant authority for external-rights actions, which remain explicit owner decisions.
 
 ## Optional GPU queue
 
@@ -201,11 +201,13 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 | `FIRM_PORT` | `8787` | Dashboard port |
 | `FIRM_CODEX_AUDIT_ENABLED` | `true` | Enable isolated Codex audits |
 | `FIRM_OPERATIONAL_RESOLVER_ENABLED` | `true` | Let Codex inspect every new stable Claude input episode and decide whether to respond |
-| `FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS` | `120000` | Per-episode AI Session Resolver timeout; failure is silent and fail-closed |
+| `FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS` | `600000` | Per-episode Research Session Resolver timeout; unresolved failures remain visible and retry |
+| `FIRM_OPERATIONAL_RESOLVER_ATTEMPTS` | `2` | Immediate fresh-process attempts before durable backoff |
+| `FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY` | `2` | Bounded resolver workers; prevents restart-time connection stampedes |
 | `FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS` | `300000` | Minimum interval between AI messages to the same project |
 | `FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR` | `3` | Delivery safety budget per project; it does not constrain Codex's reasoning |
 | `FIRM_SCAN_INTERVAL_MS` | `9000000` | Periodic audit interval (2.5 hours) |
-| `FIRM_REANCHOR_MODE` | `approval` | `off`, `approval`, or `auto` |
+| `FIRM_REANCHOR_MODE` | `auto` | `off`, `approval`, or `auto` |
 | `FIRM_GOAL_LOOP_ENABLED` | `false` | Global kill switch for generic automatic continuation |
 | `FIRM_GOAL_MAX_CONTINUES_PER_DAY` | `48` | Hard rolling 24-hour continuation limit per project |
 | `FIRM_GPU_QUEUE_ENABLED` | `false` | Enable remote queue collection |

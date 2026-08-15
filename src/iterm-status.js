@@ -191,16 +191,16 @@ export function classifyItermTail(value, options = {}) {
     const nextOption = following.slice(1).search(/\n\s*\d+\.\s+/u);
     const selectedBlock = (nextOption >= 0 ? following.slice(0, nextOption + 1) : following).trim();
     const selectedText = selectedBlock.replace(/^❯\s*\d+\.\s*/u, '').replace(/\s+/g, ' ').trim();
-    const humanOwned = /\b(?:grant|authorize|permission|approve|withdraw|submit|purchase|delete|archive)\b|\b(?:paper identity|contribution type|new seed|venue change)\b|(?:授权|批准|许可|删除|归档|投稿|撤稿|付费|更换\s*seed|贡献类型|论文身份)/i.test(selectedText);
+    const externalAuthorization = /\b(?:credential|password|secret|purchase|payment|accept terms|legal consent|ethics approval|delete|public release|formal submission|withdraw submission)\b|(?:账号凭证|密码|密钥|付费|购买|接受(?:条款|协议)|法律承诺|伦理审批|删除|正式投稿|公开发布|撤回投稿)/i.test(selectedText);
     if (confirmationIndex >= 0) {
       return {
         state: 'CONFIRMATION', reason: 'interactive_confirmation_visible',
         selectedOptionNumber: Number(selectedChoice[1]), selectedOptionText: selectedText.slice(0, 500),
       };
     }
-    if (humanOwned) {
+    if (externalAuthorization) {
       return {
-        state: 'BOUNDARY_CHOICE', reason: 'claimed_human_boundary_choice_visible',
+        state: 'BOUNDARY_CHOICE', reason: 'external_authorization_choice_visible',
         selectedOptionNumber: Number(selectedChoice[1]), selectedOptionText: selectedText.slice(0, 500),
         recommendedSelected: /\(Recommended\)|（推荐）|推荐选项/i.test(selectedBlock),
       };

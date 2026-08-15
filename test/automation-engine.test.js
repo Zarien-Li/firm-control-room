@@ -142,6 +142,86 @@ test('AI session resolver answers a stopped Claude episode exactly once', async 
   });
 });
 
+test('AI-decided state rewrite remains pending until a later resolver verifies it', async () => {
+  await fixture(async (store) => {
+    const localConfig = config();
+    localConfig.goalLoop.enabled = false;
+    localConfig.watchdog.stopReviewStableMs = 0;
+    localConfig.operationalResolver = { cooldownMs: 0, maxMessagesPerHour: 3 };
+    const sent = [];
+    let resolverCalls = 0;
+    let receivedObligations = [];
+    const session = {
+      pid: 118, projectId: 'ACL_1', tty: '/dev/ttys118',
+      terminal: {
+        state: 'WAITING_INPUT', tailHash: 'false-user-gate',
+        terminalEvidence: 'Task #53 is [USER]-gated. Which option should I choose?',
+      },
+      heartbeat: {
+        historyCursor: 'acl8:1', episodeId: 'acl8-episode-1', deliveryMarkers: [],
+        latestAssistantText: 'Task #53 is [USER]-gated. Which option should I choose?',
+      },
+    };
+    const engine = new AutomationEngine({
+      config: localConfig, store, sessionManager: new FakeSessions([]),
+      discoverExternalSessions: async () => ({ items: [session] }),
+      externalSessionInput: async (_target, message) => sent.push(message),
+      operationalResolver: async (_project, _session, _jobs, obligations) => {
+        resolverCalls += 1;
+        receivedObligations = obligations;
+        if (resolverCalls === 1) {
+          return {
+            status: 'completed', resolution: {
+              shouldSend: true,
+              message: 'Do not launch Task #53. Rewrite its live-state label as AI-decided deferred.',
+              confidence: 0.98, evidenceSource: 'session:latest-assistant',
+              evidenceQuote: 'Task #53 is [USER]-gated',
+              rationale: 'This is an ordinary research decision.', recheckAfterSeconds: 0,
+              stateReconciliation: 'Task #53 and the authoritative live state must say AI-decided deferred and must not say they await the user.',
+              fulfilledReconciliationKeys: [],
+              grounding: { grounded: true, eligible: true },
+            },
+          };
+        }
+        return {
+          status: 'completed', resolution: {
+            shouldSend: false, message: '', confidence: 0.99,
+            evidenceSource: 'session:latest-assistant',
+            evidenceQuote: 'Task #53 is now AI-decided deferred',
+            rationale: 'The authoritative state rewrite is complete.', recheckAfterSeconds: 0,
+            stateReconciliation: '',
+            fulfilledReconciliationKeys: obligations.map((item) => item.key),
+            grounding: { grounded: true, eligible: true },
+          },
+        };
+      },
+    });
+
+    await engine.cycle();
+    const pending = store.listPendingAutomationEvents(100)
+      .find((event) => event.eventType === 'AI_STATE_RECONCILIATION_REQUIRED');
+    assert.ok(pending, JSON.stringify(store.listAutomationEvents(100), null, 2));
+    assert.equal(sent.length, 1);
+
+    session.terminal = {
+      state: 'WAITING_INPUT', tailHash: 'reconciled-state',
+      terminalEvidence: 'Task #53 is now AI-decided deferred.',
+    };
+    session.heartbeat = {
+      ...session.heartbeat,
+      historyCursor: 'acl8:2', episodeId: 'acl8-episode-2',
+      latestAssistantText: 'Task #53 is now AI-decided deferred in the authoritative live state.',
+    };
+    await engine.cycle();
+
+    assert.equal(resolverCalls, 2);
+    assert.equal(receivedObligations.length, 1);
+    assert.equal(receivedObligations[0].key, pending.eventKey);
+    assert.equal(store.getAutomationEvent(pending.eventKey).status, 'RESOLVED');
+    assert.equal(sent.length, 1);
+  });
+});
+
 test('AI session resolver can keep a stopped episode silent without a hard-coded wait category', async () => {
   await fixture(async (store) => {
     const disabled = config();
@@ -218,12 +298,16 @@ test('failed AI resolution retries the same stopped episode after backoff', asyn
     });
     await engine.cycle();
     assert.equal(calls, 1);
+    const pendingRecovery = store.listPendingAutomationEvents(20)
+      .find((item) => item.eventType === 'AI_SESSION_RESOLUTION_WITHHELD');
+    assert.ok(pendingRecovery, 'resolver failure must remain visible while recovery is pending');
     now = new Date('2026-08-11T00:00:30Z');
     await engine.cycle();
     assert.equal(calls, 1);
     now = new Date('2026-08-11T00:01:01Z');
     await engine.cycle();
     assert.equal(calls, 2);
+    assert.equal(store.getAutomationEvent(pendingRecovery.eventKey).status, 'RESOLVED');
   });
 });
 
@@ -993,7 +1077,7 @@ test('opt-in Goal Loop continues only at a normal Claude prompt', async () => {
     });
     await engine.cycle({ forceQueue: true });
     assert.equal(sessions.inputs.length, 1);
-    assert.match(sessions.inputs[0].data, /USER-APPROVED CONTINUATION RESPONSE/);
+    assert.match(sessions.inputs[0].data, /RESEARCH CONTINUATION RESPONSE/);
     assert.doesNotMatch(sessions.inputs[0].data, /submission-ready paper/);
     const event = store.listAutomationEvents(10)
       .find((item) => item.eventType === 'GOAL_CONTINUED');
@@ -1079,7 +1163,7 @@ test('opt-in Goal Loop safely continues one verified external iTerm session', as
     await engine.cycle({ forceQueue: true });
     assert.equal(sent.length, 1);
     assert.equal(sent[0].session.pid, 12345);
-    assert.match(sent[0].message, /USER-APPROVED CONTINUATION RESPONSE/);
+    assert.match(sent[0].message, /RESEARCH CONTINUATION RESPONSE/);
     assert.doesNotMatch(sent[0].message, /submission-ready paper/);
     assert.match(sent[0].message, /Resolve only the ordinary question or option/i);
     assert.equal(store.listAutomationEvents(10)
@@ -1271,7 +1355,7 @@ test('a Codex-cleared external stop bypasses ordinary cooldown but keeps the goa
     }, { verdict: 'PASS' });
     assert.equal(result.status, 'awaiting_history_ack');
     assert.equal(sent.length, 1, 'review clearance should bypass the 60-second test cooldown');
-    assert.match(sent[0].message, /USER-APPROVED CONTINUATION RESPONSE/);
+    assert.match(sent[0].message, /RESEARCH CONTINUATION RESPONSE/);
     let event = store.listAutomationEvents(10)
       .find((item) => item.eventKey.includes('goal:reviewed-stop'));
     assert.equal(event.status, 'SENT');

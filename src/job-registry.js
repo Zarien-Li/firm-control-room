@@ -5,7 +5,10 @@ export const JOB_STATES = new Set(['pending', 'running', 'done', 'failed', 'canc
 export const ACTIVE_JOB_STATES = new Set(['pending', 'running']);
 export const TERMINAL_JOB_STATES = new Set(['done', 'failed', 'cancelled']);
 const TRANSITIONS = Object.freeze({
-  pending: new Set(['pending', 'running', 'failed', 'cancelled']),
+  // An external executor can start and finish between two authoritative polls.
+  // The registry records observed lifecycle state; it must not require every
+  // intermediate state to have been sampled.
+  pending: new Set(['pending', 'running', 'done', 'failed', 'cancelled']),
   running: new Set(['running', 'done', 'failed', 'cancelled']),
   done: new Set(['done']), failed: new Set(['failed']), cancelled: new Set(['cancelled']),
 });
