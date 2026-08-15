@@ -34,13 +34,21 @@ npm run service:install
 
 The installer creates a private runtime copy under
 `~/.local/lib/firm-control-room`, stores mutable state under
-`~/.local/state/firm-control-room`, renders the LaunchAgent with the current home
-directory, and starts it with `launchctl`.
+`~/.local/state/firm-control-room`, and installs two background LaunchAgents:
+
+- `com.firm.control-room.broker` owns persistent PTYs and the stable broker socket;
+- `com.firm.control-room` owns the Web/API process.
+
+There is no nested restart loop. `launchd` is the single supervisor for both
+processes, and restarting the Web service does not terminate broker-owned sessions.
+Raw scan and GPU queue snapshots are retained within configured bounds; canonical
+job lifecycle rows and project progress remain in SQLite.
 
 Verify with:
 
 ```bash
 npm run service:status
+launchctl print gui/$(id -u)/com.firm.control-room.broker
 curl -sS http://127.0.0.1:8787/api/health
 ```
 

@@ -3,6 +3,13 @@ import { chmod, unlink } from 'node:fs/promises';
 
 const MAX_MESSAGE_BYTES = 128 * 1024;
 
+function endSocket(socket, payload) {
+  if (socket.destroyed || !socket.writable || socket.writableEnded) return;
+  // Clients deliberately destroy timed-out RPC sockets. A late reply must not
+  // turn that ordinary disconnect into an uncaught EPIPE that kills the broker.
+  socket.end(payload, () => {});
+}
+
 function rpcError(error) {
   return {
     code: error.code || 'internal_error',
@@ -38,23 +45,31 @@ async function dispatch(manager, method, params = {}) {
 export async function createBrokerServer({ socketPath, manager }) {
   const server = createServer((socket) => {
     let input = Buffer.alloc(0);
+    let dispatched = false;
+    socket.on('error', () => {
+      // Per-connection failures are isolated. The broker process owns PTYs and
+      // must survive a browser refresh, client timeout, or abandoned request.
+    });
     socket.on('data', async (chunk) => {
+      if (dispatched) return;
       input = Buffer.concat([input, chunk]);
       if (input.length > MAX_MESSAGE_BYTES) {
-        socket.end(`${JSON.stringify({ ok: false, error: {
+        dispatched = true;
+        endSocket(socket, `${JSON.stringify({ ok: false, error: {
           code: 'message_too_large', message: 'Broker message exceeds 128 KiB', status: 413,
         } })}\n`);
         return;
       }
       const newline = input.indexOf(10);
       if (newline < 0) return;
+      dispatched = true;
       socket.pause();
       try {
         const request = JSON.parse(input.subarray(0, newline).toString('utf8'));
         const result = await dispatch(manager, request.method, request.params);
-        socket.end(`${JSON.stringify({ ok: true, result })}\n`);
+        endSocket(socket, `${JSON.stringify({ ok: true, result })}\n`);
       } catch (error) {
-        socket.end(`${JSON.stringify({ ok: false, error: rpcError(error) })}\n`);
+        endSocket(socket, `${JSON.stringify({ ok: false, error: rpcError(error) })}\n`);
       }
     });
   });
@@ -75,13 +90,21 @@ export async function createBrokerServer({ socketPath, manager }) {
   };
 }
 
-export function probeBroker(socketPath) {
+export function probeBroker(socketPath, timeoutMs = 1000) {
   return new Promise((resolve) => {
     const socket = createConnection(socketPath);
-    socket.once('connect', () => {
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.destroy();
-      resolve(true);
+      resolve(value);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    socket.once('connect', () => {
+      finish(true);
     });
-    socket.once('error', () => resolve(false));
+    socket.once('error', () => finish(false));
   });
 }

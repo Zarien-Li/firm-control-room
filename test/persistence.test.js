@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createEvidenceBundle, verifyEvidenceBundle } from '../src/evidence.js';
 import { createStore } from '../src/store.js';
@@ -116,6 +117,35 @@ test('evidence bundle hashes verify and SQLite retains history', async () => {
   } finally {
     store?.close();
     if (evidence) await chmod(evidence.directory, 0o755);
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
+test('raw scan and GPU snapshot history stays within configured retention', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'firm-retention-'));
+  let store;
+  try {
+    store = await createStore(directory, { scanRetention: 10, gpuSnapshotRetention: 20 });
+    for (let index = 0; index < 25; index += 1) {
+      store.save(
+        { collectedAt: new Date(index * 1000).toISOString(), projects: [{ index }] },
+        { auditedAt: new Date(index * 1000).toISOString(), findings: [] },
+        { bundleHash: index.toString(16).padStart(64, '0'), directory: `/evidence/${index}` },
+      );
+    }
+    for (let index = 0; index < 45; index += 1) {
+      store.saveGpuQueueSnapshot({
+        collectedAt: new Date(index * 1000).toISOString(), status: 'ok', items: [{ index }],
+      });
+    }
+    store.close();
+    store = null;
+    const db = new DatabaseSync(join(directory, 'history.sqlite'), { readOnly: true });
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM scans').get().count, 10);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM gpu_queue_snapshots').get().count, 20);
+    db.close();
+  } finally {
+    store?.close();
     await rm(directory, { recursive: true, force: true });
   }
 });

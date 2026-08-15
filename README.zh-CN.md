@@ -82,6 +82,8 @@ FIRM_CODEX_AUDIT_ENABLED=false npm start
 ## 自动化边界
 
 - broker 持有 Claude PTY，网页或 Web 服务重启不会杀死托管会话；
+- macOS 服务使用两个独立 LaunchAgent：broker 与 Web/API 分别由 launchd 监督，不再嵌套第二层重启循环；broker socket 位于稳定状态目录；
+- 原始控制快照和 GPU 队列快照采用有界保留，避免长时间运行后 SQLite 无限膨胀；Job Registry 生命周期与项目进度仍完整保留；
 - 高频 Goal Loop 默认关闭；研究目标只保存在项目的 `CLAUDE.md` 与权威 live state，不反复注入会话；
 - 每个新的、稳定的 Claude 输入停点都会交给短生命周期 Codex；Codex 直接理解上下文，自主决定是否回复以及回复什么，不再由代码枚举科学错误、等待类型或伪“用户边界”；
 - `CLAUDE.md` 中带标记的 research-authority block 是持久授权源。普通选题、方法、证据、论文身份、公开数据、项目依赖和常规算力选择属于研究自治域；

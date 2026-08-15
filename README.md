@@ -199,6 +199,10 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 | `FIRM_CONFIG` | `config/projects.json` | Project configuration file |
 | `FIRM_HOST` | `127.0.0.1` | Local bind address |
 | `FIRM_PORT` | `8787` | Dashboard port |
+| `FIRM_SCAN_RETENTION` | `50` | Maximum bulky raw control-room snapshots retained locally |
+| `FIRM_GPU_SNAPSHOT_RETENTION` | `200` | Maximum bulky raw GPU queue snapshots retained locally |
+| `FIRM_BROKER_SOCKET` | `<data-dir>/control-plane/broker.sock` | Stable Unix socket for the persistent PTY broker |
+| `FIRM_BROKER_AUTOSTART` | `true` | Development fallback; the macOS service sets this to `false` and uses a separate broker LaunchAgent |
 | `FIRM_CODEX_AUDIT_ENABLED` | `true` | Enable isolated Codex audits |
 | `FIRM_OPERATIONAL_RESOLVER_ENABLED` | `true` | Let Codex inspect every new stable Claude input episode and decide whether to respond |
 | `FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS` | `600000` | Per-episode Research Session Resolver timeout; unresolved failures remain visible and retry |
@@ -225,7 +229,7 @@ npm run smoke
 npm run acceptance:restart
 ```
 
-The test suite covers broker/web restarts, delayed acknowledgements, interrupted sends, terminal noise, fast work cycles, collector degradation, GPU monitor loss, valid GPU waits, and duplicate-delivery prevention.
+The test suite covers broker/web restarts, timed-out clients disconnecting before a broker response, bounded SQLite history, delayed acknowledgements, interrupted sends, terminal noise, fast work cycles, collector degradation, GPU monitor loss, valid GPU waits, and duplicate-delivery prevention.
 
 ## Security model
 
