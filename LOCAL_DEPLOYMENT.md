@@ -41,6 +41,7 @@ The installer creates a private runtime copy under
 
 There is no nested restart loop. `launchd` is the single supervisor for both
 processes, and restarting the Web service does not terminate broker-owned sessions.
+The service never opens Terminal.app; both processes run directly in the background.
 Raw scan and GPU queue snapshots are retained within configured bounds; canonical
 job lifecycle rows and project progress remain in SQLite.
 

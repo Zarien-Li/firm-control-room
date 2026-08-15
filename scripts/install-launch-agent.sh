@@ -49,8 +49,7 @@ rsync -a --delete \
 
 chmod +x \
   "$RUNTIME/scripts/firm-supervisor.command" \
-  "$RUNTIME/scripts/firm-broker.command" \
-  "$RUNTIME/scripts/launch-firm-if-needed.sh"
+  "$RUNTIME/scripts/firm-broker.command"
 
 if [[ ! -f "$STATE/history.sqlite" && -d "$REPO/var" ]]; then
   rsync -a "$REPO/var/" "$STATE/"
