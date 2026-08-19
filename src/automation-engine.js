@@ -1,14 +1,23 @@
 import { createHash } from 'node:crypto';
 import { collectGpuQueue, emptyGpuQueueSnapshot } from './gpu-queue.js';
 import { JobRegistry } from './job-registry.js';
-import { jobWaitStatus } from './job-wait.js';
 import { probeSchedulerMonitor } from './scheduler-monitor.js';
 
-const ACTIVE_SESSION_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'WAITING_INPUT']);
-const AI_INPUT_STATES = new Set([
+const ACTIVE_SESSION_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'PROVIDER_TRANSIENT', 'WAITING_INPUT']);
+const INPUT_STATES = new Set([
   'WAITING_INPUT', 'ROUTINE_CHOICE', 'BOUNDARY_CHOICE', 'INTERACTIVE_CONFIRMATION',
 ]);
 const TERMINAL_QUEUE_STATES = new Set(['done', 'failed', 'cancelled']);
+const AUTO_DELIVERY_TYPES = new Set([
+  'CONTINUITY_RESUME_READY',
+  'CONTINUITY_CHOICE_READY',
+  'JOB_RESULT_READY',
+  'GPU_PREPARATION_REQUIRED',
+  'GPU_REQUEST_SUBMITTED',
+  'GPU_SCHEDULER_MONITOR_MISSING',
+  'GPU_EFFICIENCY_ALERT',
+  'GPU_RESULT_READY',
+]);
 
 function eventSeverity(state) {
   if (state === 'failed') return 'error';
@@ -25,88 +34,61 @@ function eventProject(item, projectIds) {
 
 function queuePrompt(event) {
   const item = event.source?.queueItem || {};
+  const envelope = {
+    schema: 'firm.operational-event.v1',
+    eventId: event.id,
+    eventType: event.eventType,
+    projectId: event.targetId || null,
+    runId: event.runId || null,
+  };
+  if (event.eventType === 'CONTINUITY_RESUME_READY') {
+    return `[FIRM CONTINUITY ${event.source?.episode || event.id}]\n${event.message}`;
+  }
   if (event.eventType === 'JOB_RESULT_READY') {
     const job = event.source?.job || {};
-    return [
-      '[FIRM OPERATIONAL EVENT — REGISTERED JOB RESULT]',
-      `Job ${event.runId} reached authoritative state: ${job.state}`,
-      `Executor: ${job.executor || 'unknown'}; kind: ${job.kind || 'unknown'}`,
-      'Read the registered result and preserve raw evidence. This notification does not prescribe scientific interpretation or a new method.',
-    ].join('\n');
+    return `[FIRM_JOB_EVENT] ${JSON.stringify({
+      ...envelope,
+      state: job.state || null,
+      kind: job.kind || null,
+      executor: job.executor || null,
+      result: job.result || null,
+    })}`;
   }
   if (event.eventType === 'GPU_PREPARATION_REQUIRED') {
     const readiness = item.submissionReadiness || { state: 'NOT_READY', missing: [] };
-    return [
-      '[FIRM OPERATIONAL EVENT — GPU PREPARATION REQUIRED]',
-      `Run: ${event.runId}`,
-      `Missing preparation evidence: ${(readiness.missing || []).join(', ') || 'unspecified'}`,
-      'Repair only the declared preparation defect, then resubmit through the canonical helper. Do not reinterpret the science or start a different experiment.',
-    ].join('\n');
+    return `[FIRM_JOB_EVENT] ${JSON.stringify({
+      ...envelope,
+      state: readiness.state,
+      missing: readiness.missing || [],
+      remotePath: item.remotePath || null,
+    })}`;
   }
-  if (event.eventType === 'GPU_SCHEDULER_MONITOR_MISSING') {
-    const health = event.source?.monitorHealth || {};
-    return [
-      '[FIRM OPERATIONAL EVENT — GPU SCHEDULER MONITOR]',
-      'The scheduler-owned global monitor is not healthy.',
-      `Reason: ${health.reason || 'unknown'}`,
-      `PID file: ${health.pidFile || 'not configured'}`,
-      'Re-read GPU_SCHEDULER_START_PROMPT.md and the Global Scheduler Monitor sections in GPU_QUEUE_SPEC.md and CLAUDE.md.',
-      'Restore exactly one global monitor now, verify its PID and initial normalized snapshot, then remain in MONITORING_IDLE.',
-      'FIRM is reporting an operational liveness failure only. Do not change project science or terminate workers from utilization alone.',
-    ].join('\n');
-  }
-  if (event.eventType === 'GPU_EFFICIENCY_ALERT') {
-    const efficiency = item.efficiency || {};
-    return [
-      '[FIRM OPERATIONAL EVENT — GPU EFFICIENCY]',
-      `Run: ${event.runId}`,
-      `Phase: ${item.telemetry?.phase || 'unknown'}`,
-      `Classification: ${efficiency.state || 'UNMEASURED'} (${efficiency.reason || 'no_reason'})`,
-      `Average GPU utilization: ${Number.isFinite(efficiency.averageUtilizationPct) ? `${efficiency.averageUtilizationPct.toFixed(1)}%` : 'unmeasured'}`,
-      `Progress marker: ${item.telemetry?.progressMarker || 'none'}`,
-      efficiency.recommendation || 'Inspect the worker and publish phase-aware telemetry.',
-      'This is a diagnostic request. Never terminate or resize a worker solely because utilization is low; confirm phase, progress, logs, and workload intent first.',
-    ].join('\n');
-  }
-  if (event.eventType === 'GPU_REQUEST_SUBMITTED') {
-    const readiness = item.submissionReadiness || { state: 'UNDECLARED', missing: [] };
-    return [
-      '[FIRM OPERATIONAL EVENT — GPU QUEUE]',
-      `A GPU request was submitted: ${event.runId}`,
-      `Remote queue path: ${item.remotePath}`,
-      `Submission readiness: ${readiness.state}`,
-      `Missing readiness evidence: ${(readiness.missing || []).join(', ') || 'none'}`,
-      `First GPU action: ${readiness.firstGpuAction || 'undeclared'}`,
-      'Inspect REQUEST.md and command.sh, then follow GPU_SUBMISSION_READINESS.md, GPU_QUEUE_SPEC.md, and the Scheduler contract exactly.',
-      readiness.state === 'READY'
-        ? 'Readiness metadata passed structural validation; independently confirm the artifacts and command before launch.'
-        : 'Do not launch this request. Leave it pending and tell the project which preparation evidence is missing.',
-      'This is an operational wake-up only. Do not reinterpret the project science or change its research direction.',
-    ].join('\n');
-  }
-  return [
-    '[FIRM OPERATIONAL EVENT — GPU RESULT]',
-    `GPU run ${event.runId} reached queue state: ${item.state}`,
-    `Remote result path: ${item.remotePath}/RESULT.md`,
-    'Read the authoritative RESULT.md through the established Merlin access, preserve raw evidence, and continue under the project research contract.',
-    'This notification does not prescribe the scientific interpretation or the next method.',
-  ].join('\n');
+  return `[FIRM_CONTROL_EVENT] ${JSON.stringify({
+    ...envelope,
+    queueState: item.state || null,
+    remotePath: item.remotePath || null,
+    readiness: item.submissionReadiness || null,
+    telemetry: item.telemetry || null,
+    efficiency: item.efficiency || null,
+    monitorHealth: event.source?.monitorHealth || null,
+  })}`;
 }
 
-function automationPrompt(event) {
-  return queuePrompt(event);
-}
-
-function goalPrompt(policy) {
-  return [
-    '[FIRM RESEARCH CONTINUATION RESPONSE]',
-    'Resolve only the ordinary question or option in your immediately preceding message from evidence already present. Stay inside the current construction episode; do not begin a new method, call Codex, or restate the project objective because of this response.',
-  ].join('\n');
-}
+function automationPrompt(event) { return queuePrompt(event); }
 
 function acceptsExternalOperationalInput(session) {
   return session.terminal?.state === 'WAITING_INPUT'
     || (session.terminal?.state === 'WORKING' && session.terminal?.acceptsQueuedInput === true);
+}
+
+function acceptsExternalEventInput(event, session) {
+  if (event.eventType !== 'CONTINUITY_RESUME_READY') {
+    return acceptsExternalOperationalInput(session);
+  }
+  const sameProcess = Number(event.source?.pid) === Number(session.pid);
+  const sameEpisode = event.source?.episode
+    && event.source.episode === session.heartbeat?.episodeId;
+  return sameProcess && sameEpisode && session.terminal?.state === 'WAITING_INPUT';
 }
 
 function acceptsManagedOperationalInput(session) {
@@ -123,14 +105,6 @@ function acknowledgedPrompt(prompt, messageKey) {
   return `[FIRM DELIVERY ${messageKey}]\n${prompt}`;
 }
 
-function goalBudgetSince(config, now, sessionEpoch = null) {
-  const rolling = new Date(now.getTime() - 24 * 60 * 60 * 1000).toISOString();
-  const epoch = config.goalLoop?.budgetEpoch;
-  return [rolling, epoch, sessionEpoch]
-    .filter((value) => value && Number.isFinite(Date.parse(value)))
-    .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
-}
-
 export class AutomationEngine {
   constructor({
     config,
@@ -141,11 +115,10 @@ export class AutomationEngine {
     externalSessionInput = null,
     externalSessionSubmit = null,
     externalSessionClear = null,
-    externalSessionDismissChoice = null,
-    operationalResolver = null,
-    onExternalSessionStopped = null,
+    externalSessionChoose = null,
     schedulerMonitorProbe = probeSchedulerMonitor,
     jobRegistry = null,
+    continuitySupervisor = null,
     now = () => new Date(),
   }) {
     this.config = config;
@@ -156,21 +129,18 @@ export class AutomationEngine {
     this.externalSessionInput = externalSessionInput;
     this.externalSessionSubmit = externalSessionSubmit;
     this.externalSessionClear = externalSessionClear;
-    this.externalSessionDismissChoice = externalSessionDismissChoice;
-    this.operationalResolver = operationalResolver;
-    this.onExternalSessionStopped = onExternalSessionStopped;
+    this.externalSessionChoose = externalSessionChoose;
     this.schedulerMonitorProbe = schedulerMonitorProbe;
     this.jobRegistry = jobRegistry || new JobRegistry({ store, now });
+    this.continuitySupervisor = continuitySupervisor;
     this.now = now;
     this.projectIds = new Set(config.projects.map((project) => project.id));
     this.queue = store.latestGpuQueueSnapshot()?.snapshot
       || emptyGpuQueueSnapshot(config.gpuQueue.enabled ? 'pending' : 'disabled');
     this.cyclePromise = null;
     this.lastQueuePollAt = 0;
-    this.externalWaitingSince = new Map();
     this.externalDispatches = new Map();
     this.externalTerminalStates = new Map();
-    this.externalStopCandidates = new Map();
     this.externalUnknownCandidates = new Map();
     this.externalProgressCandidates = new Map();
     this.externalInteractionActions = new Map();
@@ -223,8 +193,17 @@ export class AutomationEngine {
     this.#ingestJobs(this.jobsSnapshot());
     await this.#watchSessions();
     await this.#watchExternalStops();
+    if (this.continuitySupervisor) {
+      const external = await this.#externalSessions();
+      this.continuitySupervisor.observe({
+        sessions: external.items || [],
+        jobs: this.jobsSnapshot(),
+        events: this.store.listAutomationEvents(1000),
+        outbox: this.store.listOutboxMessages(1000),
+        schedulerMonitor: this.monitorSnapshot(),
+      });
+    }
     await this.#deliverPending();
-    await this.#runGoalLoop();
     return {
       queue: this.queue,
       events: this.store.listAutomationEvents(200),
@@ -346,7 +325,6 @@ export class AutomationEngine {
       }
     }
     const seen = new Set();
-    const stoppedResolutions = [];
     for (const session of external.items || []) {
       if (!session.projectId || !this.projectIds.has(session.projectId)) continue;
       const key = `${session.projectId}:${session.pid}`;
@@ -395,12 +373,14 @@ export class AutomationEngine {
       }
       const previous = this.externalTerminalStates.get(key);
       this.externalTerminalStates.set(key, current);
-      if (handledInteractions.has(key)) {
-        this.externalStopCandidates.delete(key);
-        this.externalWaitingSince.delete(key);
+      const tailHash = session.terminal?.tailHash || 'unknown';
+      if (['PROVIDER_TRANSIENT', 'RATE_LIMITED'].includes(current)) {
+        await this.#observeProviderWait(session, tailHash);
         continue;
       }
-      const tailHash = session.terminal?.tailHash || 'unknown';
+      if (handledInteractions.has(key)) {
+        continue;
+      }
       const priorUnknown = this.externalUnknownCandidates.get(key);
       if (current === 'UNKNOWN') {
         let candidate = priorUnknown;
@@ -430,18 +410,6 @@ export class AutomationEngine {
               tailHash, firstSeenAt: new Date(candidate.firstSeenAt).toISOString(),
             },
           });
-          if (typeof this.onExternalSessionStopped === 'function') {
-            await this.onExternalSessionStopped({
-              projectId: session.projectId,
-              pid: session.pid,
-              tty: session.tty,
-              previousState: previous || 'UNKNOWN',
-              detectedAt: this.now().toISOString(),
-              tailHash,
-              safeToContinue: false,
-              stopReason: 'stable_unknown_no_output',
-            });
-          }
         }
       } else if (priorUnknown) {
         if (priorUnknown.eventKey) {
@@ -494,19 +462,6 @@ export class AutomationEngine {
               toolKinds: heartbeat.toolKinds || [],
             },
           });
-          if (typeof this.onExternalSessionStopped === 'function') {
-            await this.onExternalSessionStopped({
-              projectId: session.projectId,
-              pid: session.pid,
-              tty: session.tty,
-              previousState: current,
-              detectedAt: this.now().toISOString(),
-              tailHash,
-              safeToContinue: false,
-              stopReason: 'effective_progress_stalled',
-              heartbeat,
-            });
-          }
         }
       } else if (priorProgress) {
         if (priorProgress.eventKey) {
@@ -514,61 +469,13 @@ export class AutomationEngine {
         }
         this.externalProgressCandidates.delete(key);
       }
-      if (!AI_INPUT_STATES.has(current)) {
-        this.externalStopCandidates.delete(key);
-        continue;
-      }
-      const waitingEvidenceAt = session.heartbeat?.episodeId
-        || session.heartbeat?.historyCursor
-        || session.heartbeat?.historyWriteAt
-        || session.heartbeat?.lastProgressAt || null;
-      const existingStop = this.externalStopCandidates.get(key);
-      const evidenceAdvanced = Boolean(
-        existingStop?.waitingEvidenceAt && waitingEvidenceAt
-        && existingStop.waitingEvidenceAt !== waitingEvidenceAt,
-      );
-      const distinctWaitingEpisode = !AI_INPUT_STATES.has(previous)
-        || !existingStop
-        || (existingStop.stop.tailHash !== tailHash && evidenceAdvanced);
-      if (distinctWaitingEpisode) {
-        this.externalStopCandidates.set(key, {
-          firstSeenAt: this.now().getTime(),
-          dispatched: false,
-          waitingEvidenceAt,
-          stop: {
-            projectId: session.projectId,
-            pid: session.pid,
-            tty: session.tty,
-            previousState: previous || 'UNSEEN',
-            detectedAt: this.now().toISOString(),
-            tailHash: session.terminal?.tailHash || 'unknown',
-            episodeId: session.heartbeat?.episodeId || null,
-          },
-        });
-      }
-      const candidate = this.externalStopCandidates.get(key);
-      if (!candidate || candidate.dispatched) continue;
-      if (candidate.deferUntil && this.now().getTime() < candidate.deferUntil) continue;
-      const stableMs = this.config.watchdog.stopReviewStableMs ?? 15 * 1000;
-      if (this.now().getTime() - candidate.firstSeenAt < stableMs) continue;
-      if (typeof this.operationalResolver === 'function') {
-        stoppedResolutions.push({ session, candidate });
-      } else {
-        candidate.dispatched = true;
-        if (typeof this.onExternalSessionStopped === 'function') {
-          await this.onExternalSessionStopped(candidate.stop);
-        }
-      }
+      // ContinuitySupervisor owns stable input and routine-choice episodes.
+      // The watchdog records liveness here without creating a second decision path.
+      if (INPUT_STATES.has(current)) continue;
     }
-    await Promise.all(stoppedResolutions.map(async ({ session, candidate }) => {
-      const outcome = await this.#resolveStoppedSession(session, candidate);
-      candidate.dispatched = outcome.done;
-      candidate.deferUntil = outcome.deferUntil || null;
-    }));
     for (const key of this.externalTerminalStates.keys()) {
       if (!seen.has(key)) {
         this.externalTerminalStates.delete(key);
-        this.externalStopCandidates.delete(key);
         const unknown = this.externalUnknownCandidates.get(key);
         if (unknown?.eventKey) this.#resolveEvent(unknown.eventKey, 'session_no_longer_present');
         this.externalUnknownCandidates.delete(key);
@@ -579,192 +486,51 @@ export class AutomationEngine {
     }
   }
 
-  async #resolveStoppedSession(session, candidate) {
-    const project = this.config.projects.find((item) => item.id === session.projectId);
-    if (!project) return { done: true };
-    const reconciliationEvents = this.store.listPendingAutomationEvents(1000).filter((event) => (
-      event.targetId === session.projectId
-      && event.eventType === 'AI_STATE_RECONCILIATION_REQUIRED'
-    ));
-    const reconciliationObligations = reconciliationEvents.map((event) => ({
-      key: event.eventKey,
-      expectation: event.source?.expectation || event.message,
-      createdAt: event.createdAt,
-    }));
-    if (!candidate.operationalResult) {
-      try {
-        candidate.operationalResult = await this.operationalResolver(
-          project, session, this.jobsSnapshot().items || [], reconciliationObligations,
-        );
-      } catch (error) {
-        candidate.operationalResult = { status: 'failed', error: String(error.message || error) };
-      }
-    }
-    const result = candidate.operationalResult;
-    const resolution = result?.resolution;
-    const identity = candidate.stop.episodeId || candidate.stop.tailHash;
-    const resolutionKey = `operational-resolution:${session.projectId}:${session.pid}:${identity}`;
-    const failureKey = `operational-resolution-failure:${session.projectId}:${session.pid}:${identity}`;
-    if (result?.status !== 'completed' || !resolution?.grounding?.eligible) {
-      this.store.createAutomationEvent({
-        eventKey: failureKey,
-        category: 'session_control', eventType: 'AI_SESSION_RESOLUTION_WITHHELD',
-        targetId: session.projectId, severity: 'warn', status: 'PENDING',
-        title: `Research resolver recovery pending: ${session.projectId}`,
-        message: 'The research resolver could not yet produce a grounded response. This stopped episode remains open and will be retried automatically.',
-        source: { deliveryPolicy: 'none', pid: session.pid, resolverStatus: result?.status || 'unknown' },
-        note: String(result?.error || 'ungrounded_operational_resolution').slice(0, 500),
-      });
-      const requestedRetrySeconds = Number(resolution?.recheckAfterSeconds || 0);
-      if (result?.status !== 'completed' || requestedRetrySeconds > 0
-          || reconciliationObligations.length > 0) {
-        candidate.operationalResult = null;
-        candidate.resolverAttempts = Number(candidate.resolverAttempts || 0) + 1;
-        const retryMs = requestedRetrySeconds > 0
-          ? requestedRetrySeconds * 1000
-          : Math.min(15 * 60_000, 60_000 * (2 ** Math.min(candidate.resolverAttempts - 1, 4)));
-        return { done: false, deferUntil: this.now().getTime() + retryMs };
-      }
-      return { done: true };
-    }
-    const pendingFailure = this.store.getAutomationEvent(failureKey);
-    if (pendingFailure && ['PENDING', 'HELD', 'SENT'].includes(pendingFailure.status)) {
-      this.store.setAutomationEvent(pendingFailure.id, {
-        status: 'RESOLVED', note: `resolver_recovered:${identity}`,
-      });
-    }
-    for (const key of resolution.fulfilledReconciliationKeys || []) {
-      const fulfilled = reconciliationEvents.find((event) => event.eventKey === key);
-      if (fulfilled) {
-        this.store.setAutomationEvent(fulfilled.id, {
-          status: 'RESOLVED',
-          note: `verified_by_operational_resolver:${identity}`,
-        });
-      }
-    }
-    this.store.createAutomationEvent({
-      eventKey: resolutionKey,
-      category: 'session_control', eventType: 'AI_SESSION_DECISION',
-      targetId: session.projectId, severity: 'info', status: 'RESOLVED',
-      title: `AI session decision for ${session.projectId}`,
-      message: resolution.rationale,
-      source: {
-        deliveryPolicy: 'none', pid: session.pid,
-        evidenceSource: resolution.evidenceSource,
-        evidenceQuote: resolution.evidenceQuote,
-        confidence: resolution.confidence,
-        shouldSend: resolution.shouldSend,
-        recheckAfterSeconds: resolution.recheckAfterSeconds,
-      },
-    });
-    if (!resolution.shouldSend) {
-      if (resolution.recheckAfterSeconds > 0) {
-        candidate.operationalResult = null;
-        return {
-          done: false,
-          deferUntil: this.now().getTime() + resolution.recheckAfterSeconds * 1000,
-        };
-      }
-      return { done: true };
-    }
-
-    let currentSession = null;
-    try {
-      const fresh = await this.discoverExternalSessions();
-      currentSession = (fresh.items || []).find((item) => (
-        item.projectId === session.projectId && item.pid === session.pid
-      )) || null;
-    } catch {
-      currentSession = null;
-    }
-    const currentEvidenceAt = currentSession?.heartbeat?.episodeId
-      || currentSession?.heartbeat?.historyCursor
-      || currentSession?.heartbeat?.historyWriteAt
-      || currentSession?.heartbeat?.lastProgressAt || null;
-    const sameEpisode = Boolean(currentSession)
-      && AI_INPUT_STATES.has(currentSession.terminal?.state)
-      && (
-        (candidate.waitingEvidenceAt && currentEvidenceAt
-          && candidate.waitingEvidenceAt === currentEvidenceAt)
-        || (!candidate.waitingEvidenceAt && !currentEvidenceAt
-          && currentSession.terminal?.tailHash === candidate.stop.tailHash)
-      );
-    if (!sameEpisode) {
-      this.store.createAutomationEvent({
-        eventKey: `${resolutionKey}:stale`,
-        category: 'session_control', eventType: 'AI_SESSION_RESPONSE_STALE',
-        targetId: session.projectId, severity: 'info', status: 'RESOLVED',
-        title: `Discarded stale AI response: ${session.projectId}`,
-        message: 'The Claude session advanced while Codex was deciding, so the old response was not delivered.',
-        source: { deliveryPolicy: 'none', pid: session.pid, resolutionKey },
-      });
-      return { done: true };
-    }
-
-    const now = this.now().getTime();
-    const hourAgo = now - 60 * 60 * 1000;
-    const recoveries = this.store.listAutomationEvents(5000).filter((event) => (
-      event.targetId === session.projectId
-      && event.eventType === 'AI_SESSION_MESSAGE_SENT'
-      && Date.parse(event.collectedAt || event.createdAt || 0) >= hourAgo
-    ));
-    const limit = this.config.operationalResolver?.maxMessagesPerHour ?? 3;
-    if (recoveries.length >= limit) {
-      this.store.createAutomationEvent({
-        eventKey: `${resolutionKey}:message-limit`,
-        category: 'session_control', eventType: 'AI_SESSION_MESSAGE_LIMIT_REACHED',
-        targetId: session.projectId, severity: 'error', status: 'RESOLVED',
-        title: `AI session message limit reached: ${session.projectId}`,
-        message: 'Codex requested another response, but the bounded hourly message budget is exhausted.',
-        source: { deliveryPolicy: 'manual', pid: session.pid, recoveries: recoveries.length, limit },
-      });
-      return { done: true };
-    }
-    const latest = recoveries.sort((a, b) => (
-      Date.parse(b.collectedAt || b.createdAt || 0) - Date.parse(a.collectedAt || a.createdAt || 0)
-    ))[0];
-    const latestAt = latest ? Date.parse(latest.collectedAt || latest.createdAt || 0) : NaN;
-    const cooldownMs = this.config.operationalResolver?.cooldownMs ?? 5 * 60 * 1000;
-    if (Number.isFinite(latestAt) && now - latestAt < cooldownMs) {
-      return { done: false, deferUntil: latestAt + cooldownMs };
-    }
-
+  async #observeProviderWait(session, tailHash) {
+    const terminal = session.terminal || {};
+    const isRateLimit = terminal.state === 'RATE_LIMITED';
+    const fingerprint = isRateLimit
+      ? terminal.resetAt || tailHash
+      : terminal.providerFailureFingerprint || tailHash;
     const event = this.store.createAutomationEvent({
-      eventKey: `${resolutionKey}:message`,
-      category: 'session_control', eventType: 'AI_SESSION_MESSAGE_SENT',
+      eventKey: `provider-wait:${session.projectId}:${session.pid}:${terminal.state}:${fingerprint}`,
+      category: 'session_control',
+      eventType: isRateLimit ? 'PROVIDER_RATE_WAIT' : 'PROVIDER_TRANSIENT_WAIT',
+      targetId: session.projectId,
+      severity: 'info',
+      status: 'RESOLVED',
+      title: `${isRateLimit ? 'Rate limit' : 'Provider transient'} observed: ${session.projectId}`,
+      message: 'Provider availability is an operational observation. FIRM does not inject research text, retries, or instructions into the Claude session.',
+      source: { deliveryPolicy: 'none', pid: session.pid, terminalState: terminal.state,
+        resetAt: terminal.resetAt || null, providerFailureFingerprint: terminal.providerFailureFingerprint || null },
+      note: 'passive_provider_observation',
+    });
+    if (!isRateLimit || typeof this.externalSessionSubmit !== 'function') return;
+    const resetAt = Date.parse(terminal.resetAt || '');
+    if (!Number.isFinite(resetAt) || this.now().getTime() < resetAt) return;
+    const resume = this.store.createAutomationEvent({
+      eventKey: `provider-rate-resume:${session.projectId}:${session.pid}:${terminal.resetAt || tailHash}`,
+      category: 'session_control', eventType: 'PROVIDER_RATE_RESUME_ENTER',
       targetId: session.projectId, severity: 'info',
-      title: `AI responded to stopped session: ${session.projectId}`,
-      message: resolution.rationale,
-      source: { deliveryPolicy: 'auto_notify', pid: session.pid, resolutionKey },
+      title: `Rate-limit resume attempt: ${session.projectId}`,
+      message: 'FIRM issued one Enter-only continuation after the stated provider reset. No text was injected.',
+      source: { deliveryPolicy: 'enter_only_once', pid: session.pid, resetAt: terminal.resetAt || null,
+        observedEventId: event.id },
     });
-    if (['ROUTINE_CHOICE', 'BOUNDARY_CHOICE', 'INTERACTIVE_CONFIRMATION']
-      .includes(currentSession.terminal?.state)) {
-      if (!this.externalSessionDismissChoice) return { done: false };
-      await this.externalSessionDismissChoice(currentSession);
-    }
-    const delivery = await this.#sendExternalAcknowledged({
-      event, session: currentSession, prompt: resolution.message,
-      note: 'codex_autonomous_session_response',
-    });
-    if (delivery.status !== 'failed' && resolution.stateReconciliation) {
-      this.store.createAutomationEvent({
-        eventKey: `${resolutionKey}:state-reconciliation`,
-        category: 'session_control',
-        eventType: 'AI_STATE_RECONCILIATION_REQUIRED',
-        targetId: session.projectId,
-        severity: 'info',
-        status: 'PENDING',
-        title: `AI state reconciliation required: ${session.projectId}`,
-        message: resolution.stateReconciliation,
-        source: {
-          deliveryPolicy: 'none',
-          pid: session.pid,
-          expectation: resolution.stateReconciliation,
-          originResolutionKey: resolutionKey,
-        },
+    if (resume.status !== 'PENDING') return;
+    // Persist before the irreversible keypress: supervisor restarts can never replay it.
+    this.store.setAutomationEvent(resume.id, { status: 'SENT', note: 'enter_only_dispatch_started' });
+    try {
+      await this.externalSessionSubmit(session);
+      this.store.setAutomationEvent(resume.id, {
+        status: 'DELIVERED', sessionId: session.id || null,
+        deliveredAt: this.now().toISOString(), note: 'enter_only_rate_resume',
+      });
+    } catch (error) {
+      this.store.setAutomationEvent(resume.id, {
+        status: 'HELD', note: `enter_only_rate_resume_failed:${String(error.message || error).slice(0, 300)}`,
       });
     }
-    return { done: delivery.status !== 'failed' };
   }
 
   async #reconcileForegroundInteractions(sessions) {
@@ -795,7 +561,7 @@ export class AutomationEngine {
         const eventKey = `interaction:${session.projectId}:${session.pid}:acked-draft:${marker}`;
         if (terminal.modelWorking) continue;
         if (prior?.eventKey === eventKey) {
-          const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
+          const retryDelayMs = this.config.watchdog.enterRetryMs ?? 2_000;
           if (this.now().getTime() - prior.lastAttemptAt < retryDelayMs) continue;
           if (prior.attempts >= 3) {
             this.store.createAutomationEvent({
@@ -913,7 +679,7 @@ export class AutomationEngine {
           && ['SENT_AWAITING_ACK', 'UNCERTAIN'].includes(candidate.status)
         )).length === 1;
       const lastEnterAt = Date.parse(message.lastEnterAt || message.sentAt || message.sendingAt || '');
-      const retryDelayMs = this.config.goalLoop.enterRetryMs ?? 2_000;
+      const retryDelayMs = this.config.watchdog.enterRetryMs ?? 2_000;
       if ((marker !== message.messageKey && !collapsedPasteMatches)
           || !['SENT_AWAITING_ACK', 'UNCERTAIN'].includes(message.status)
           || typeof this.externalSessionSubmit !== 'function'
@@ -1130,8 +896,7 @@ export class AutomationEngine {
     const assistantAt = Date.parse(session.heartbeat?.latestAssistantAt || '');
     const assistantAdvanced = Number.isFinite(assistantAt) && assistantAt > activeDispatch.deliveredAt;
     const completedFastCycle = assistantAdvanced
-      && session.terminal.tailHash !== activeDispatch.tailHash
-      && elapsed >= this.config.goalLoop.graceMs;
+      && session.terminal.tailHash !== activeDispatch.tailHash;
     if (activeDispatch.seenWorking || completedFastCycle) {
       this.externalDispatches.delete(targetId);
       for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
@@ -1144,7 +909,7 @@ export class AutomationEngine {
       }
       return false;
     }
-    const postAckStallMs = this.config.goalLoop.postAckStallMs ?? 60_000;
+    const postAckStallMs = this.config.watchdog.postAckStallMs ?? 60_000;
     if (elapsed >= postAckStallMs) {
       const priorStalls = this.store.listAutomationEvents(1000).filter((candidate) => (
         candidate.targetId === targetId
@@ -1250,17 +1015,120 @@ export class AutomationEngine {
         }
       }
     }
+
+    // Session ids are process instances, while watchdog health belongs to the
+    // configured target. Once a newer healthy instance owns a target, an older
+    // instance's failure is history rather than an actionable current fault.
+    const healthyByTarget = new Map();
+    for (const session of sessions) {
+      if (!['RUNNING', 'WAITING_INPUT', 'RATE_LIMITED'].includes(session.status)) continue;
+      const prior = healthyByTarget.get(session.projectId);
+      if (!prior || Date.parse(session.createdAt || '') > Date.parse(prior.createdAt || '')) {
+        healthyByTarget.set(session.projectId, session);
+      }
+    }
+    for (const event of this.store.listPendingAutomationEvents(1000).filter((candidate) => (
+      candidate.eventType === 'SESSION_UNHEALTHY'
+    ))) {
+      const replacement = healthyByTarget.get(event.targetId);
+      const failed = event.source?.session;
+      if (!replacement || !failed?.id || replacement.id === failed.id) continue;
+      const replacementAt = Date.parse(replacement.createdAt || '');
+      const failedAt = Date.parse(failed.createdAt || '');
+      if (!Number.isFinite(replacementAt) || !Number.isFinite(failedAt) || replacementAt <= failedAt) {
+        continue;
+      }
+      this.store.setAutomationEvent(event.id, {
+        status: 'RESOLVED',
+        sessionId: replacement.id,
+        note: 'superseded_by_newer_healthy_managed_session',
+      });
+    }
   }
 
   async #deliverPending() {
     const events = this.store.listPendingAutomationEvents(500)
-      .filter((event) => event.source?.deliveryPolicy === 'auto_notify');
+      .filter((event) => (
+        event.source?.deliveryPolicy === 'auto_notify'
+        && AUTO_DELIVERY_TYPES.has(event.eventType)
+      ));
     if (!events.length) return;
     let sessions = await this.sessionManager.list();
     let external = null;
     const deliveredTargets = new Set();
     for (const event of events) {
       if (deliveredTargets.has(event.targetId)) continue;
+      if (event.eventType === 'CONTINUITY_CHOICE_READY') {
+        external ||= await this.#externalSessions();
+        const projectSessions = (external.items || []).filter((session) => (
+          session.projectId === event.targetId
+        ));
+        const candidates = projectSessions.filter((session) => (
+          Number(event.source?.pid) === Number(session.pid)
+          && event.source?.episode === session.heartbeat?.episodeId
+          && session.terminal?.state === 'ROUTINE_CHOICE'
+        ));
+        if (candidates.length === 1 && this.externalSessionChoose) {
+          const session = candidates[0];
+          const currentChoice = Number(session.terminal?.selectedOptionNumber);
+          const targetChoice = Number(event.source?.optionNumber);
+          if (!Number.isSafeInteger(currentChoice) || currentChoice < 1
+              || !Number.isSafeInteger(targetChoice) || targetChoice < 1) {
+            this.#holdEvent(event, 'invalid_continuity_choice_coordinates');
+            continue;
+          }
+          // Mark the event before sending key strokes. If iTerm reports an error
+          // after a partial write, replaying arrows could select a different item.
+          this.store.setAutomationEvent(event.id, {
+            status: 'SENT',
+            sessionId: `external:${session.pid}`,
+            note: `continuity_choice_dispatching:${currentChoice}->${targetChoice}`,
+          });
+          try {
+            await this.externalSessionChoose(session, currentChoice, targetChoice);
+            this.store.setAutomationEvent(event.id, {
+              status: 'DELIVERED',
+              sessionId: `external:${session.pid}`,
+              deliveredAt: this.now().toISOString(),
+              note: `continuity_choice_submitted:${currentChoice}->${targetChoice}`,
+            });
+            deliveredTargets.add(event.targetId);
+          } catch (error) {
+            const detail = String(error.message || error).slice(0, 300);
+            this.store.setAutomationEvent(event.id, {
+              status: 'SENT',
+              sessionId: `external:${session.pid}`,
+              note: `continuity_choice_dispatch_uncertain:${detail}`,
+            });
+            this.store.createAutomationEvent({
+              eventKey: `${event.eventKey}:dispatch-uncertain`,
+              category: 'research_continuity',
+              eventType: 'CONTINUITY_CHOICE_DISPATCH_UNCERTAIN',
+              targetId: event.targetId,
+              severity: 'error',
+              title: `Routine choice dispatch uncertain: ${event.targetId}`,
+              message: 'The iTerm choice action may have been partially applied and will not be replayed automatically.',
+              source: {
+                deliveryPolicy: 'manual', pid: session.pid,
+                episode: event.source?.episode, currentChoice, targetChoice, detail,
+              },
+            });
+          }
+          continue;
+        }
+        if (candidates.length > 1) {
+          this.#holdEvent(event, 'multiple_matching_continuity_choice_sessions');
+          continue;
+        }
+        if (projectSessions.length) {
+          this.#resolveEvent(event.eventKey, 'stale_continuity_choice_episode');
+          continue;
+        }
+        this.#holdEvent(event, this.externalSessionChoose
+          ? 'continuity_choice_session_not_found'
+          : 'external_choice_adapter_unavailable');
+        continue;
+      }
       let candidates = sessions.filter((session) => (
         session.projectId === event.targetId
         && acceptsManagedOperationalInput(session)
@@ -1297,7 +1165,7 @@ export class AutomationEngine {
         (event.targetId === 'GPU_SCHEDULER'
           ? session.controlId === event.targetId
           : session.projectId === event.targetId)
-        && acceptsExternalOperationalInput(session)
+        && acceptsExternalEventInput(event, session)
       ));
       if (externalCandidates.length === 1 && this.externalSessionInput) {
         if (this.#externalDispatchBlocked(event.targetId, externalCandidates[0])) continue;
@@ -1313,6 +1181,18 @@ export class AutomationEngine {
       if (externalCandidates.length > 1) {
         this.#holdEvent(event, 'multiple_waiting_external_sessions');
         continue;
+      }
+
+      if (event.eventType === 'CONTINUITY_RESUME_READY') {
+        const current = (external.items || []).find((session) => (
+          session.projectId === event.targetId
+        ));
+        if (current && (Number(event.source?.pid) !== Number(current.pid)
+            || event.source?.episode !== current.heartbeat?.episodeId
+            || current.terminal?.state !== 'WAITING_INPUT')) {
+          this.#resolveEvent(event.eventKey, 'stale_continuity_episode');
+          continue;
+        }
       }
 
       if (event.targetId === 'GPU_SCHEDULER') {
@@ -1374,380 +1254,14 @@ export class AutomationEngine {
     }
   }
 
-  async #runGoalLoop() {
-    if (this.config.goalLoop?.enabled !== true) return;
-    const policies = this.store.listAutomationPolicies().filter((policy) => policy.enabled);
-    if (!policies.length) return;
-    let sessions = await this.sessionManager.list();
-    let external = null;
-    for (const policy of policies) {
-      if (!this.projectIds.has(policy.targetId)) continue;
-      const managed = sessions.find((session) => (
-        session.projectId === policy.targetId && ACTIVE_SESSION_STATES.has(session.status)
-      ));
-      if (!managed) {
-        external ||= await this.#externalSessions();
-        const externalSession = external.items?.find((session) => session.projectId === policy.targetId);
-        if (externalSession) {
-          const waitingKey = `${policy.targetId}:${externalSession.pid}`;
-          if (jobWaitStatus(externalSession, this.jobsSnapshot()).waiting) {
-            this.externalWaitingSince.delete(waitingKey);
-            continue;
-          }
-          if (Number(externalSession.heartbeat?.activeToolProcessCount || 0) > 0) {
-            this.externalWaitingSince.delete(waitingKey);
-            continue;
-          }
-          if (this.#externalDispatchBlocked(policy.targetId, externalSession)) {
-            if (externalSession.terminal?.state !== 'WAITING_INPUT') {
-              this.externalWaitingSince.delete(waitingKey);
-            }
-            continue;
-          }
-          if (externalSession.terminal?.state !== 'WAITING_INPUT') {
-            this.externalWaitingSince.delete(waitingKey);
-            if (externalSession.terminal?.state === 'CONFIRMATION') {
-              this.store.createAutomationEvent({
-                eventKey: `goal:${waitingKey}:confirmation:${externalSession.terminal.tailHash || 'unknown'}`,
-                category: 'goal_loop', eventType: 'GOAL_CONFIRMATION_REQUIRED',
-                targetId: policy.targetId, severity: 'warn',
-                title: `${policy.targetId} requires interactive confirmation`,
-                message: 'Goal Loop does not answer trust, permission, or approval prompts.',
-                source: { deliveryPolicy: 'manual', pid: externalSession.pid },
-              });
-            }
-            continue;
-          }
-          const waiting = this.externalWaitingSince.get(waitingKey);
-          const tailHash = externalSession.terminal?.tailHash || 'unknown';
-          if (!waiting || waiting.tailHash !== tailHash) {
-            this.externalWaitingSince.set(waitingKey, {
-              firstSeenAt: this.now().getTime(),
-              tailHash,
-            });
-            continue;
-          }
-          if (this.now().getTime() - waiting.firstSeenAt < this.config.goalLoop.graceMs) continue;
-          if (!this.externalSessionInput) {
-            this.store.createAutomationEvent({
-              eventKey: `goal:${policy.targetId}:external_session`,
-              category: 'goal_loop', eventType: 'GOAL_EXTERNAL_SESSION',
-              targetId: policy.targetId, severity: 'info', status: 'HELD',
-              title: `Goal Loop cannot control external ${policy.targetId}`,
-              message: 'The project is running outside the persistent broker and no safe iTerm relay is available.',
-              source: { deliveryPolicy: 'manual', pid: externalSession.pid },
-              note: 'migrate_project_to_managed_session_for_goal_loop',
-            });
-            continue;
-          }
-          const pendingIntervention = this.store.listInterventions(1000).some((item) => (
-            item.projectId === policy.targetId && ['PROPOSED', 'HELD'].includes(item.status)
-          ));
-          const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
-            item.targetId === policy.targetId && item.category !== 'goal_loop'
-            && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
-          ));
-          if (pendingIntervention || blockingEvent) continue;
-          const since = goalBudgetSince(
-            this.config,
-            this.now(),
-            externalSession.terminal?.lastRateLimitResetAt,
-          );
-          const recent = this.store.recentGoalActions(policy.targetId, since);
-          if (recent.count >= this.config.goalLoop.maxContinuesPerDay) continue;
-          // Delivery acknowledgement prevents duplicate input, while the cooldown
-          // prevents blind retries. A new assistant turn is a new input point and
-          // may contain routine options that Claude must resolve autonomously.
-          const latestAssistantAt = Date.parse(externalSession.heartbeat?.latestAssistantAt || '');
-          const assistantAdvanced = recent.lastDeliveredAt
-            && Number.isFinite(latestAssistantAt)
-            && latestAssistantAt > Date.parse(recent.lastDeliveredAt);
-          if (recent.lastDeliveredAt && !assistantAdvanced
-              && this.now().getTime() - Date.parse(recent.lastDeliveredAt)
-                < this.config.goalLoop.cooldownMs) {
-            continue;
-          }
-          const event = this.store.createAutomationEvent({
-            eventKey: `goal:external:${externalSession.pid}:${externalSession.terminal.tailHash}:continue`,
-            category: 'goal_loop', eventType: 'GOAL_CONTINUED',
-            targetId: policy.targetId, severity: 'info',
-            title: `Goal Loop continued external ${policy.targetId}`,
-            message: 'A fixed, scope-preserving continuation was sent to a verified iTerm input prompt.',
-            source: { deliveryPolicy: 'none', pid: externalSession.pid },
-          });
-          if (!['PENDING', 'HELD'].includes(event.status)) continue;
-          const delivery = await this.#sendExternalAcknowledged({
-            event,
-            session: externalSession,
-            prompt: goalPrompt(policy),
-            note: 'goal_loop_external_iterm_continue',
-          });
-          if (delivery.status !== 'failed') {
-            this.externalWaitingSince.delete(waitingKey);
-          }
-          continue;
-        }
-        try {
-          const started = await this.sessionManager.start(policy.targetId, {
-            cols: 120,
-            rows: 32,
-            bootstrap: true,
-          });
-          sessions = await this.sessionManager.list();
-          this.store.createAutomationEvent({
-            eventKey: `goal:${policy.targetId}:started:${started.id}`,
-            category: 'goal_loop',
-            eventType: 'GOAL_SESSION_STARTED',
-            targetId: policy.targetId,
-            severity: 'info',
-            status: 'RESOLVED',
-            title: `Goal Loop started ${policy.targetId}`,
-            message: 'A managed research session was started with the fixed project bootstrap.',
-            source: { deliveryPolicy: 'none', sessionId: started.id },
-          });
-        } catch (error) {
-          this.store.createAutomationEvent({
-            eventKey: `goal:${policy.targetId}:start_failed`,
-            category: 'goal_loop',
-            eventType: 'GOAL_START_FAILED',
-            targetId: policy.targetId,
-            severity: 'error',
-            title: `Goal Loop could not start ${policy.targetId}`,
-            message: 'The fixed managed session could not be started.',
-            source: { deliveryPolicy: 'manual' },
-            note: String(error.message || error).slice(0, 500),
-          });
-        }
-        continue;
-      }
-      // Managed PTYs still write normal Claude history. Use that assistant-only
-      // evidence for GPU waits so echoed prompts cannot forge a wait marker.
-      external ||= await this.#externalSessions();
-      const managedHistory = external.items?.find((session) => (
-        session.projectId === policy.targetId
-        && (managed.pid == null || session.pid === managed.pid)
-      ));
-      if (jobWaitStatus(managedHistory, this.jobsSnapshot()).waiting) continue;
-      if (Number(managedHistory?.heartbeat?.activeToolProcessCount || 0) > 0) continue;
-      if (managed.status !== 'WAITING_INPUT' || managed.bootstrapStatus !== 'SENT') continue;
-      const waitingSince = managed.waitingSince ? Date.parse(managed.waitingSince) : NaN;
-      if (!Number.isFinite(waitingSince)
-          || this.now().getTime() - waitingSince < this.config.goalLoop.graceMs) continue;
-      if (managed.waitReason !== 'claude_prompt') {
-        this.store.createAutomationEvent({
-          eventKey: `goal:${managed.id}:${managed.waitingSince}:confirmation`,
-          category: 'goal_loop',
-          eventType: 'GOAL_CONFIRMATION_REQUIRED',
-          targetId: policy.targetId,
-          severity: 'warn',
-          title: `${policy.targetId} requires interactive confirmation`,
-          message: 'Goal Loop does not answer trust, permission, or approval prompts.',
-          source: { deliveryPolicy: 'manual', sessionId: managed.id },
-        });
-        continue;
-      }
-      const pendingIntervention = this.store.listInterventions(1000).some((item) => (
-        item.projectId === policy.targetId && ['PROPOSED', 'HELD'].includes(item.status)
-      ));
-      const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
-        item.targetId === policy.targetId
-        && item.category !== 'goal_loop'
-        && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
-      ));
-      if (pendingIntervention || blockingEvent) {
-        this.store.createAutomationEvent({
-          eventKey: `goal:${managed.id}:${managed.waitingSince}:blocked`,
-          category: 'goal_loop',
-          eventType: 'GOAL_BLOCKED_BY_INBOX',
-          targetId: policy.targetId,
-          severity: 'warn',
-          title: `${policy.targetId} Goal Loop paused for review`,
-          message: 'A research-boundary intervention or high-priority operational event requires attention first.',
-          source: {
-            deliveryPolicy: 'manual',
-            sessionId: managed.id,
-            blocker: pendingIntervention ? 'codex_intervention' : blockingEvent?.eventKey,
-          },
-        });
-        continue;
-      }
-      const since = goalBudgetSince(this.config, this.now());
-      const recent = this.store.recentGoalActions(policy.targetId, since);
-      if (recent.count >= this.config.goalLoop.maxContinuesPerDay) {
-        this.store.createAutomationEvent({
-          eventKey: `goal:${policy.targetId}:daily_budget:${since.slice(0, 10)}`,
-          category: 'goal_loop',
-          eventType: 'GOAL_DAILY_BUDGET_REACHED',
-          targetId: policy.targetId,
-          severity: 'warn',
-          title: `${policy.targetId} reached its Goal Loop daily limit`,
-          message: 'Automatic continuation stopped before unbounded token use.',
-          source: { deliveryPolicy: 'manual', count: recent.count },
-        });
-        continue;
-      }
-      if (recent.lastDeliveredAt
-          && this.now().getTime() - Date.parse(recent.lastDeliveredAt) < this.config.goalLoop.cooldownMs) {
-        continue;
-      }
-      const event = this.store.createAutomationEvent({
-        eventKey: `goal:${managed.id}:${managed.waitingSince}:continue`,
-        category: 'goal_loop',
-        eventType: 'GOAL_CONTINUED',
-        targetId: policy.targetId,
-        severity: 'info',
-        title: `Goal Loop continued ${policy.targetId}`,
-        message: 'A fixed, scope-preserving continuation was sent at a normal Claude input prompt.',
-        source: { deliveryPolicy: 'none', sessionId: managed.id },
-      });
-      if (!['PENDING', 'HELD'].includes(event.status)) continue;
-      const prompt = goalPrompt(policy);
-      try {
-        await this.sessionManager.input(managed.id, `${prompt}\r`);
-        this.store.setAutomationEvent(event.id, {
-          status: 'DELIVERED',
-          sessionId: managed.id,
-          deliveredAt: this.now().toISOString(),
-          note: 'goal_loop_scope_preserving_continue',
-        });
-      } catch (error) {
-        this.#holdEvent(event, `goal_continue_failed:${String(error.message || error).slice(0, 300)}`);
-      }
-    }
-  }
-
-  async continueReviewedStop(stop, review = {}) {
-    const policy = this.store.listAutomationPolicies()
-      .find((item) => item.targetId === stop.projectId && item.enabled);
-    if (!policy) return { status: 'goal_disabled' };
-    if (!['PASS', 'WARN'].includes(review.verdict)) {
-      return { status: 'review_not_cleared', verdict: review.verdict || null };
-    }
-    if (!this.externalSessionInput) return { status: 'external_input_unavailable' };
-
-    const pendingIntervention = this.store.listInterventions(1000).some((item) => (
-      item.projectId === stop.projectId && ['PROPOSED', 'HELD'].includes(item.status)
-    ));
-    const blockingEvent = this.store.listPendingAutomationEvents(1000).find((item) => (
-      item.targetId === stop.projectId
-      && item.category !== 'goal_loop'
-      && (item.severity === 'error' || item.eventType === 'JOB_RESULT_READY')
-    ));
-    if (pendingIntervention || blockingEvent) {
-      return {
-        status: 'blocked',
-        blocker: pendingIntervention ? 'codex_intervention' : blockingEvent.eventKey,
-      };
-    }
-
-    const since = goalBudgetSince(this.config, this.now());
-    const recent = this.store.recentGoalActions(stop.projectId, since);
-    if (recent.count >= this.config.goalLoop.maxContinuesPerDay) {
-      this.store.createAutomationEvent({
-        eventKey: `goal:${stop.projectId}:daily_budget:${since.slice(0, 10)}`,
-        category: 'goal_loop', eventType: 'GOAL_DAILY_BUDGET_REACHED',
-        targetId: stop.projectId, severity: 'warn',
-        title: `${stop.projectId} reached its Goal Loop daily limit`,
-        message: 'Automatic continuation stopped before unbounded token use.',
-        source: { deliveryPolicy: 'manual', count: recent.count },
-      });
-      return { status: 'daily_budget_reached', count: recent.count };
-    }
-
-    this.externalSnapshot = null;
-    const external = await this.#externalSessions();
-    const candidates = (external.items || []).filter((session) => (
-      session.projectId === stop.projectId && session.pid === stop.pid
-    ));
-    if (candidates.length !== 1) return { status: 'session_changed' };
-    const session = candidates[0];
-    const jobWait = jobWaitStatus(session, this.jobsSnapshot());
-    if (jobWait.waiting) {
-      return { status: 'waiting_for_job', runIds: jobWait.matchedRunIds };
-    }
-    if (session.terminal?.state !== 'WAITING_INPUT') {
-      return { status: 'session_already_running', terminalState: session.terminal?.state || 'UNKNOWN' };
-    }
-
-    // A witnessed WORKING -> WAITING transition proves the prior dispatch completed.
-    // This reviewed stop may bypass the ordinary cooldown, but never the daily budget.
-    if (stop.previousState === 'WORKING') {
-      this.externalDispatches.delete(stop.projectId);
-    } else if (this.#externalDispatchBlocked(stop.projectId, session)) {
-      return { status: 'dispatch_latched' };
-    }
-
-    const event = this.store.createAutomationEvent({
-      eventKey: `goal:reviewed-stop:${stop.projectId}:${stop.pid}:${stop.episodeId || stop.tailHash}:continue`,
-      category: 'goal_loop', eventType: 'GOAL_CONTINUED',
-      targetId: stop.projectId, severity: 'info',
-      title: `Reviewed stop continued: ${stop.projectId}`,
-      message: 'Codex cleared this stopping point and Goal Loop resumed it without waiting for the ordinary cooldown.',
-      source: {
-        deliveryPolicy: 'none', pid: stop.pid, stopTailHash: stop.tailHash,
-        stopEpisodeId: stop.episodeId || null,
-        reviewVerdict: review.verdict,
-      },
-    });
-    if (!['PENDING', 'HELD'].includes(event.status)) return { status: 'already_dispatched' };
-    const delivery = await this.#sendExternalAcknowledged({
-      event,
-      session,
-      prompt: goalPrompt(policy),
-      note: `reviewed_stop_${review.verdict.toLowerCase()}_continue`,
-    });
-    if (delivery.status !== 'failed') {
-      this.externalWaitingSince.delete(`${stop.projectId}:${stop.pid}`);
-      return {
-        status: delivery.status === 'acknowledged' ? 'continued' : 'awaiting_history_ack',
-        eventId: event.id,
-        messageKey: delivery.message.messageKey,
-      };
-    }
-    return { status: 'delivery_failed', eventId: event.id };
-  }
-
-  async continueExternalSession(session, prompt) {
-    if (!this.externalSessionInput) return { status: 'external_input_unavailable' };
-    if (session.terminal?.state !== 'WAITING_INPUT') {
-      return { status: 'session_not_waiting', terminalState: session.terminal?.state || 'UNKNOWN' };
-    }
-    const pending = this.store.listUnacknowledgedOutbox(5000).find((message) => (
-      message.targetId === session.projectId && message.sessionPid === session.pid
-      && ['QUEUED', 'SENDING', 'SENT_AWAITING_ACK'].includes(message.status)
-    ));
-    if (pending) {
-      return { status: 'blocked_by_pending_delivery', messageKey: pending.messageKey };
-    }
-    const episodeId = session.heartbeat?.episodeId || session.terminal?.tailHash || 'unknown';
-    const event = this.store.createAutomationEvent({
-      eventKey: `session:manual-continue:${session.projectId}:${session.pid}:${episodeId}`,
-      category: 'session_control',
-      eventType: 'MANUAL_CONTINUATION',
-      targetId: session.projectId,
-      severity: 'info',
-      title: `Manual continuation: ${session.projectId}`,
-      message: 'The user requested a fixed continuation at a verified Claude input prompt.',
-      source: { deliveryPolicy: 'none', pid: session.pid, episodeId },
-    });
-    const delivery = await this.#sendExternalAcknowledged({
-      event,
-      session,
-      prompt,
-      note: 'user_requested_external_continuation',
-    });
-    return {
-      status: delivery.status,
-      eventId: event.id,
-      messageKey: delivery.message?.messageKey || null,
-    };
-  }
-
   async deliver(eventId, requestedSessionId = null) {
     const event = this.store.listAutomationEvents(1000)
       .find((candidate) => candidate.id === Number(eventId));
     if (!event) throw new Error('Automation event was not found');
     if (!['PENDING', 'HELD'].includes(event.status)) throw new Error('Automation event is not pending');
+    if (!AUTO_DELIVERY_TYPES.has(event.eventType)) {
+      throw new Error('Only allowlisted operational or continuity events can be delivered');
+    }
     if (!event.targetId) throw new Error('Automation event has no mapped target');
     const sessions = await this.sessionManager.list();
     const candidates = sessions.filter((session) => (
@@ -1777,7 +1291,7 @@ export class AutomationEngine {
 }
 
 export const automationInternals = Object.freeze({
-  eventProject, queuePrompt, automationPrompt, goalPrompt,
+  eventProject, queuePrompt, automationPrompt,
   acceptsExternalOperationalInput, acceptsManagedOperationalInput,
   deliveryKey, acknowledgedPrompt,
 });

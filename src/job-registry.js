@@ -163,10 +163,12 @@ export class JobRegistry {
           startedAt: item.startedAt || (item.state === 'running' ? item.signalAt : null),
           finishedAt: item.finishedAt || (TERMINAL_JOB_STATES.has(item.state) ? item.signalAt : null),
           progress: item.telemetry?.progressMarker ? { marker: item.telemetry.progressMarker } : null,
-          result: TERMINAL_JOB_STATES.has(item.state) ? { remotePath: item.remotePath } : null,
+          result: TERMINAL_JOB_STATES.has(item.state) ? {
+            remotePath: item.remotePath, terminal: item.terminal || null,
+          } : null,
           metadata: { remotePath: item.remotePath, signalAt: item.signalAt,
             phase: item.telemetry?.phase || null, submissionReadiness: item.submissionReadiness || null,
-            efficiency: item.efficiency || null,
+            efficiency: item.efficiency || null, terminalIntegrity: item.terminalIntegrity || null,
             lifecycleObserved: ACTIVE_JOB_STATES.has(item.state) }, source: 'gpu_queue',
         });
       } else if (!TERMINAL_JOB_STATES.has(current.state) || current.state === item.state) {
@@ -181,7 +183,7 @@ export class JobRegistry {
         const progress = item.telemetry?.progressMarker
           ? { marker: item.telemetry.progressMarker } : current.progress;
         const result = TERMINAL_JOB_STATES.has(item.state)
-          ? { remotePath: item.remotePath } : current.result;
+          ? { remotePath: item.remotePath, terminal: item.terminal || null } : current.result;
         if (queueState === current.state
             && JSON.stringify(metadata) === JSON.stringify(current.metadata)
             && JSON.stringify(progress) === JSON.stringify(current.progress)

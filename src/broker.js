@@ -1,4 +1,5 @@
-import { unlink } from 'node:fs/promises';
+import { mkdir, unlink } from 'node:fs/promises';
+import { dirname } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { loadConfig } from './config.js';
 import { createPtyBackend } from './pty-backend.js';
@@ -10,6 +11,7 @@ export async function startBroker(overrides = {}) {
   if (await probeBroker(config.brokerSocketPath)) {
     throw new Error(`A session broker is already listening at ${config.brokerSocketPath}`);
   }
+  await mkdir(dirname(config.brokerSocketPath), { recursive: true });
   await unlink(config.brokerSocketPath).catch((error) => {
     if (error.code !== 'ENOENT') throw error;
   });

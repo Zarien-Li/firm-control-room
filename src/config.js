@@ -1,6 +1,6 @@
 import { constants } from 'node:fs';
 import { access, readFile } from 'node:fs/promises';
-import { homedir, tmpdir } from 'node:os';
+import { homedir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
@@ -68,75 +68,11 @@ export async function loadConfig() {
     throw new Error('FIRM_SESSION_BUFFER_BYTES must be a positive safe integer');
   }
   const claudeExecutable = await resolveExecutable(process.env.FIRM_CLAUDE_EXECUTABLE || 'claude');
-  let codexExecutable = null;
-  try {
-    codexExecutable = await resolveExecutable(process.env.FIRM_CODEX_EXECUTABLE || 'codex');
-  } catch {
-    // The control plane still works when Codex is temporarily unavailable.
-  }
   let sshExecutable = null;
   try {
     sshExecutable = await resolveExecutable(process.env.FIRM_SSH_EXECUTABLE || 'ssh');
   } catch {
     // Local session management remains usable when SSH is unavailable.
-  }
-  const operationalResolverEnabled = !/^(?:0|false|off)$/i.test(
-    String(process.env.FIRM_OPERATIONAL_RESOLVER_ENABLED ?? 'true'),
-  );
-  const operationalResolverTimeoutMs = Number(
-    process.env.FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS ?? 10 * 60 * 1000,
-  );
-  const operationalMessageCooldownMs = Number(
-    process.env.FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS ?? 5 * 60 * 1000,
-  );
-  const operationalMaxMessagesPerHour = Number(
-    process.env.FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR ?? 3,
-  );
-  const operationalResolverAttempts = Number(
-    process.env.FIRM_OPERATIONAL_RESOLVER_ATTEMPTS ?? 2,
-  );
-  const operationalResolverMaxConcurrency = Number(
-    process.env.FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY ?? 2,
-  );
-  if (!Number.isFinite(operationalResolverTimeoutMs) || operationalResolverTimeoutMs < 1000) {
-    throw new Error('FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS must be at least 1000');
-  }
-  if (!Number.isFinite(operationalMessageCooldownMs)
-      || operationalMessageCooldownMs < 60 * 1000) {
-    throw new Error('FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS must be at least 60000');
-  }
-  if (!Number.isSafeInteger(operationalMaxMessagesPerHour)
-      || operationalMaxMessagesPerHour < 1 || operationalMaxMessagesPerHour > 12) {
-    throw new Error('FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR must be an integer from 1 to 12');
-  }
-  if (!Number.isSafeInteger(operationalResolverAttempts)
-      || operationalResolverAttempts < 1 || operationalResolverAttempts > 4) {
-    throw new Error('FIRM_OPERATIONAL_RESOLVER_ATTEMPTS must be an integer from 1 to 4');
-  }
-  if (!Number.isSafeInteger(operationalResolverMaxConcurrency)
-      || operationalResolverMaxConcurrency < 1 || operationalResolverMaxConcurrency > 4) {
-    throw new Error('FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY must be an integer from 1 to 4');
-  }
-  const codexAuditEnabled = !/^(?:0|false|off)$/i.test(
-    String(process.env.FIRM_CODEX_AUDIT_ENABLED ?? 'true'),
-  );
-  const codexAuditTimeoutMs = Number(process.env.FIRM_CODEX_AUDIT_TIMEOUT_MS ?? 10 * 60 * 1000);
-  const codexAuditLookbackMs = Number(process.env.FIRM_CODEX_AUDIT_LOOKBACK_MS ?? 5 * 60 * 60 * 1000);
-  if (!Number.isFinite(codexAuditTimeoutMs) || codexAuditTimeoutMs < 1000) {
-    throw new Error('FIRM_CODEX_AUDIT_TIMEOUT_MS must be at least 1000');
-  }
-  if (!Number.isFinite(codexAuditLookbackMs) || codexAuditLookbackMs < 60 * 1000) {
-    throw new Error('FIRM_CODEX_AUDIT_LOOKBACK_MS must be at least 60000');
-  }
-  const reanchorMode = String(process.env.FIRM_REANCHOR_MODE || 'auto').toLowerCase();
-  if (!['off', 'approval', 'auto'].includes(reanchorMode)) {
-    throw new Error('FIRM_REANCHOR_MODE must be off, approval, or auto');
-  }
-  const reanchorCooldownMs = Number(
-    process.env.FIRM_REANCHOR_COOLDOWN_MS ?? 10 * 60 * 60 * 1000,
-  );
-  if (!Number.isFinite(reanchorCooldownMs) || reanchorCooldownMs < 0) {
-    throw new Error('FIRM_REANCHOR_COOLDOWN_MS must be a non-negative number');
   }
   const gpuQueueEnabled = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_GPU_QUEUE_ENABLED ?? 'false'),
@@ -151,6 +87,9 @@ export async function loadConfig() {
   const gpuSchedulerAutoStart = !/^(?:0|false|off)$/i.test(
     String(process.env.FIRM_GPU_SCHEDULER_AUTO_START ?? 'false'),
   );
+  const gpuRunnerEnsureEnabled = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_GPU_QUEUE_RUNNER_ENSURE ?? 'true'),
+  );
   const gpuQueuePollMs = Number(process.env.FIRM_GPU_QUEUE_POLL_MS ?? 60 * 1000);
   const gpuQueueTimeoutMs = Number(process.env.FIRM_GPU_QUEUE_TIMEOUT_MS ?? 15 * 1000);
   const watchdogPollMs = Number(process.env.FIRM_WATCHDOG_POLL_MS ?? 15 * 1000);
@@ -160,16 +99,6 @@ export async function loadConfig() {
   const toolProgressStallMs = Number(
     process.env.FIRM_TOOL_PROGRESS_STALL_MS ?? 30 * 60 * 1000,
   );
-  const stopReviewStableMs = Number(process.env.FIRM_STOP_REVIEW_STABLE_MS ?? 15 * 1000);
-  const goalLoopEnabled = !/^(?:0|false|off)$/i.test(
-    String(process.env.FIRM_GOAL_LOOP_ENABLED ?? 'false'),
-  );
-  const goalContinueGraceMs = Number(process.env.FIRM_GOAL_CONTINUE_GRACE_MS ?? 15 * 1000);
-  const goalContinueCooldownMs = Number(
-    process.env.FIRM_GOAL_CONTINUE_COOLDOWN_MS ?? 30 * 60 * 1000,
-  );
-  const goalMaxContinuesPerDay = Number(process.env.FIRM_GOAL_MAX_CONTINUES_PER_DAY ?? 48);
-  const goalBudgetEpoch = String(process.env.FIRM_GOAL_BUDGET_EPOCH || '').trim() || null;
   for (const [name, value, minimum] of [
     ['FIRM_GPU_QUEUE_POLL_MS', gpuQueuePollMs, 1000],
     ['FIRM_GPU_QUEUE_TIMEOUT_MS', gpuQueueTimeoutMs, 1000],
@@ -178,21 +107,36 @@ export async function loadConfig() {
     ['FIRM_UNKNOWN_STALL_MS', unknownStallMs, 60 * 1000],
     ['FIRM_PROGRESS_STALL_MS', progressStallMs, 60 * 1000],
     ['FIRM_TOOL_PROGRESS_STALL_MS', toolProgressStallMs, 5 * 60 * 1000],
-    ['FIRM_STOP_REVIEW_STABLE_MS', stopReviewStableMs, 5000],
-    ['FIRM_GOAL_CONTINUE_GRACE_MS', goalContinueGraceMs, 10 * 1000],
-    ['FIRM_GOAL_CONTINUE_COOLDOWN_MS', goalContinueCooldownMs, 60 * 1000],
   ]) {
     if (!Number.isFinite(value) || value < minimum) {
       throw new Error(`${name} must be at least ${minimum}`);
     }
   }
-  if (!Number.isSafeInteger(goalMaxContinuesPerDay)
-      || goalMaxContinuesPerDay < 1
-      || goalMaxContinuesPerDay > 100) {
-    throw new Error('FIRM_GOAL_MAX_CONTINUES_PER_DAY must be an integer from 1 to 100');
+  const continuityEnabled = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_CONTINUITY_ENABLED ?? 'false'),
+  );
+  const continuitySettleMs = Number(process.env.FIRM_CONTINUITY_SETTLE_MS ?? 30 * 1000);
+  const continuityTimeoutMs = Number(process.env.FIRM_CONTINUITY_TIMEOUT_MS ?? 5 * 60 * 1000);
+  const continuityRetryMs = Number(process.env.FIRM_CONTINUITY_RETRY_MS ?? 60 * 1000);
+  const continuityMaxConcurrent = Number(process.env.FIRM_CONTINUITY_MAX_CONCURRENT ?? 2);
+  for (const [name, value, minimum] of [
+    ['FIRM_CONTINUITY_SETTLE_MS', continuitySettleMs, 0],
+    ['FIRM_CONTINUITY_TIMEOUT_MS', continuityTimeoutMs, 30 * 1000],
+    ['FIRM_CONTINUITY_RETRY_MS', continuityRetryMs, 10 * 1000],
+    ['FIRM_CONTINUITY_MAX_CONCURRENT', continuityMaxConcurrent, 1],
+  ]) {
+    if (!Number.isFinite(value) || value < minimum) {
+      throw new Error(`${name} must be at least ${minimum}`);
+    }
   }
-  if (goalBudgetEpoch && !Number.isFinite(Date.parse(goalBudgetEpoch))) {
-    throw new Error('FIRM_GOAL_BUDGET_EPOCH must be an ISO-8601 timestamp');
+  if (!Number.isSafeInteger(continuityMaxConcurrent)) {
+    throw new Error('FIRM_CONTINUITY_MAX_CONCURRENT must be an integer');
+  }
+  let codexExecutable = null;
+  if (continuityEnabled) {
+    codexExecutable = await resolveExecutable(
+      process.env.FIRM_CODEX_EXECUTABLE || '/Applications/ChatGPT.app/Contents/Resources/codex',
+    );
   }
   const defaultControlPaths = [...new Set(projects.map((project) => dirname(project.path)))];
   const controlSessionPaths = String(process.env.FIRM_CONTROL_SESSION_PATHS || '')
@@ -209,7 +153,7 @@ export async function loadConfig() {
     '--disallowedTools',
     'WebSearch,WebFetch,Edit,Write,NotebookEdit,Agent',
   ];
-  const controlTargets = gpuQueueEnabled && resolvedControlPaths.length ? [
+  const controlTargets = gpuQueueEnabled && gpuSchedulerAutoStart && resolvedControlPaths.length ? [
     {
       id: 'GPU_SCHEDULER',
       name: 'GPU Scheduler',
@@ -240,34 +184,30 @@ export async function loadConfig() {
     ...controlTargets,
   ];
   const dataDir = resolve(process.env.FIRM_DATA_DIR || join(ROOT, 'var'));
+  const scanRetention = Number(process.env.FIRM_SCAN_RETENTION ?? 50);
+  const gpuSnapshotRetention = Number(process.env.FIRM_GPU_SNAPSHOT_RETENTION ?? 200);
+  if (!Number.isSafeInteger(scanRetention) || scanRetention < 10) {
+    throw new Error('FIRM_SCAN_RETENTION must be an integer of at least 10');
+  }
+  if (!Number.isSafeInteger(gpuSnapshotRetention) || gpuSnapshotRetention < 20) {
+    throw new Error('FIRM_GPU_SNAPSHOT_RETENTION must be an integer of at least 20');
+  }
+  const brokerAutoStart = !/^(?:0|false|off)$/i.test(
+    String(process.env.FIRM_BROKER_AUTOSTART ?? 'true'),
+  );
   return {
     root: ROOT,
     configPath,
     projects,
     dataDir,
+    historyRetention: { scans: scanRetention, gpuSnapshots: gpuSnapshotRetention },
     host: process.env.FIRM_HOST || '127.0.0.1',
     port: Number(process.env.FIRM_PORT || 8787),
     scanIntervalMs,
     claudeExecutable,
     claudeArgs,
-    codexExecutable,
-    operationalResolver: {
-      enabled: operationalResolverEnabled,
-      timeoutMs: operationalResolverTimeoutMs,
-      cooldownMs: operationalMessageCooldownMs,
-      maxMessagesPerHour: operationalMaxMessagesPerHour,
-      attempts: operationalResolverAttempts,
-      maxConcurrency: operationalResolverMaxConcurrency,
-      schemaPath: join(ROOT, 'config', 'operational-resolver.schema.json'),
-    },
-    codexAuditEnabled,
-    codexAuditTimeoutMs,
-    codexAuditLookbackMs,
-    codexAuditSchemaPath: join(ROOT, 'config', 'codex-audit.schema.json'),
     claudeProjectsDir: resolve(process.env.FIRM_CLAUDE_PROJECTS_DIR
       || join(homedir(), '.claude', 'projects')),
-    reanchorMode,
-    reanchorCooldownMs,
     gpuQueue: {
       enabled: gpuQueueEnabled,
       sshExecutable,
@@ -278,28 +218,30 @@ export async function loadConfig() {
       pollMs: gpuQueuePollMs,
       timeoutMs: gpuQueueTimeoutMs,
       schedulerAutoStart: gpuSchedulerAutoStart,
-      schedulerMonitorPidFile: resolve(
+      runnerEnsureEnabled: gpuRunnerEnsureEnabled,
+      runnerPath: String(process.env.FIRM_GPU_QUEUE_RUNNER_PATH || '').trim() || null,
+      schedulerMonitorPidFile: gpuRunnerEnsureEnabled ? null : resolve(
         process.env.FIRM_GPU_SCHEDULER_MONITOR_PID_FILE
           || '/tmp/gpu_scheduler_global_monitor.pid',
       ),
     },
-    professor: { mode: 'stateless-codex', intervalMs: scanIntervalMs },
     watchdog: {
       pollMs: watchdogPollMs,
       waitingMs: watchdogWaitingMs,
       unknownStallMs,
       progressStallMs,
       toolProgressStallMs,
-      stopReviewStableMs,
-    },
-    goalLoop: {
-      enabled: goalLoopEnabled,
-      graceMs: goalContinueGraceMs,
-      cooldownMs: goalContinueCooldownMs,
-      maxContinuesPerDay: goalMaxContinuesPerDay,
-      budgetEpoch: goalBudgetEpoch,
       enterRetryMs: 2_000,
       postAckStallMs: 60_000,
+    },
+    continuity: {
+      enabled: continuityEnabled,
+      codexExecutable,
+      model: String(process.env.FIRM_CONTINUITY_MODEL || '').trim() || null,
+      settleMs: continuitySettleMs,
+      timeoutMs: continuityTimeoutMs,
+      retryMs: continuityRetryMs,
+      maxConcurrent: continuityMaxConcurrent,
     },
     controlSessionPaths: resolvedControlPaths,
     controlTargets,
@@ -310,7 +252,8 @@ export async function loadConfig() {
     sessionBufferBytes,
     brokerSocketPath: resolve(
       process.env.FIRM_BROKER_SOCKET
-        || join(tmpdir(), `firm-control-room-${process.getuid?.() ?? 'user'}.sock`),
+        || join(dataDir, 'control-plane', 'broker.sock'),
     ),
+    brokerAutoStart,
   };
 }

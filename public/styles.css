@@ -140,45 +140,6 @@ main { width: min(1600px, 100%); margin: auto; padding: 16px; }
   -webkit-line-clamp: 4;
 }
 .project-actions { display: flex; gap: 7px; margin-top: auto; padding-top: 12px; }
-.project-actions .goal-on { color: var(--mint); border-color: #376a54; }
-.project-actions .goal-off { color: var(--muted); }
-.intervention-band { margin-bottom: 14px; }
-.interventions { display: grid; gap: 7px; }
-.intervention {
-  display: grid;
-  grid-template-columns: 150px minmax(0, 1fr) auto;
-  gap: 12px;
-  align-items: center;
-  padding: 12px;
-  border: 1px solid var(--amber);
-  border-radius: 8px;
-  background: #1b1812;
-}
-.intervention small { display: block; color: var(--muted); font-size: 10px; }
-.intervention p { margin: 0; font-size: 11px; }
-.intervention-copy { min-width: 0; }
-.intervention-actions { display: flex; gap: 6px; }
-.intervention-evidence { margin-top: 8px; font-size: 11px; }
-.intervention-evidence summary {
-  width: fit-content;
-  color: var(--amber);
-  cursor: pointer;
-  user-select: none;
-}
-.evidence-list { display: grid; gap: 7px; margin-top: 7px; }
-.evidence-list section {
-  padding: 8px;
-  border-left: 2px solid #806a32;
-  background: #12110e;
-}
-.evidence-list blockquote {
-  margin: 6px 0;
-  color: var(--text);
-  white-space: pre-wrap;
-  overflow-wrap: anywhere;
-}
-.evidence-list p { color: var(--muted); }
-.evidence-empty { margin-top: 7px; }
 .scheduler-band {
   min-height: 68px;
   display: grid;
@@ -191,52 +152,6 @@ main { width: min(1600px, 100%); margin: auto; padding: 16px; }
   border-radius: 8px;
   background: #111713;
 }
-.professor-band {
-  min-height: 72px;
-  display: grid;
-  grid-template-columns: minmax(270px, 1fr) minmax(240px, .8fr) auto;
-  align-items: center;
-  gap: 16px;
-  margin-bottom: 12px;
-  padding: 11px 13px;
-  border: 1px solid #5f583d;
-  border-radius: 8px;
-  background: #18170f;
-}
-.professor-identity { display: flex; align-items: center; gap: 11px; min-width: 0; }
-.professor-identity strong, .professor-state span { display: block; }
-.professor-identity small, .professor-state small { display: block; color: var(--muted); font-size: 10px; }
-.professor-mark {
-  width: 42px;
-  height: 30px;
-  flex: 0 0 auto;
-  display: grid;
-  place-items: center;
-  border: 1px solid var(--amber);
-  border-radius: 6px;
-  color: var(--amber);
-  font: 700 10px/1 ui-monospace, monospace;
-}
-.professor-actions { display: flex; justify-content: flex-end; }
-.professor-projects {
-  grid-column: 1 / -1;
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  padding-top: 9px;
-  border-top: 1px solid var(--line);
-}
-.professor-project {
-  display: flex;
-  align-items: baseline;
-  gap: 6px;
-  padding: 4px 7px;
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  background: #11130f;
-}
-.professor-project b { font-size: 10px; }
-.professor-project small { color: var(--muted); font-size: 9px; }
 .scheduler-identity { display: flex; align-items: center; gap: 11px; min-width: 0; }
 .scheduler-identity strong, .scheduler-state span { display: block; }
 .scheduler-identity small, .scheduler-state small { display: block; color: var(--muted); font-size: 10px; }
@@ -462,11 +377,7 @@ code { color: var(--mint); font: 11px/1.4 ui-monospace, SFMono-Regular, Menlo, m
   .project-board { grid-template-columns: 1fr; }
   .overview > .section-title { align-items: flex-start; gap: 6px; }
   .portfolio-actions { align-items: flex-start; flex-direction: column; gap: 5px; }
-  .intervention { grid-template-columns: 1fr; }
   .scheduler-band { grid-template-columns: 1fr; gap: 8px; }
-  .professor-band { grid-template-columns: 1fr; gap: 8px; }
-  .professor-projects { grid-column: 1; }
-  .professor-actions { justify-content: flex-start; }
   .scheduler-activity { grid-column: 1; }
   .scheduler-activity-grid { grid-template-columns: 68px minmax(0, 1fr); }
   .scheduler-actions { justify-content: flex-start; }

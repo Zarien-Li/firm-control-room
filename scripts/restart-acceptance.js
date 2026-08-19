@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { BrokerClient } from '../src/broker-client.js';
@@ -9,6 +9,8 @@ import { createApp } from '../src/server.js';
 import { SessionManager } from '../src/session-manager.js';
 
 const root = await mkdtemp(join(tmpdir(), 'firm-real-restart-'));
+await writeFile(join(root, 'CLAUDE-RESEARCH.md'), '# restart acceptance system prompt\n');
+await writeFile(join(root, 'prompt.txt'), 'restart acceptance prompt\n');
 const executable = '/bin/cat';
 const project = { id: 'REAL', name: 'Real PTY acceptance', path: root, expected: {} };
 const socketPath = join(root, 'control-plane', 'broker.sock');
@@ -79,10 +81,10 @@ try {
   const sessions = await (await fetch(`${secondBase}/api/sessions`)).json();
   assert.equal(sessions[0].id, session.id);
   assert.equal(sessions[0].pid, session.pid);
-  assert.equal(sessions[0].cursor, before.nextCursor);
+  assert.ok(sessions[0].cursor >= before.nextCursor);
 
   await client.input(session.id, 'after-restart\r');
-  await waitForOutput(session.id, before.nextCursor, 'after-restart');
+  await waitForOutput(session.id, sessions[0].cursor, 'after-restart');
   console.log(`real restart acceptance ok: session=${session.id} pid=${session.pid}`);
 } finally {
   if (first) await first.close();

@@ -2,13 +2,18 @@ import { mkdir } from 'node:fs/promises';
 import { join } from 'node:path';
 import { DatabaseSync } from 'node:sqlite';
 
-export async function createStore(dataDir) {
+export async function createStore(dataDir, options = {}) {
   await mkdir(dataDir, { recursive: true });
   const databasePath = join(dataDir, 'history.sqlite');
   const db = new DatabaseSync(databasePath);
+  const scanRetention = Math.max(10, Number(options.scanRetention) || 50);
+  const gpuSnapshotRetention = Math.max(20, Number(options.gpuSnapshotRetention) || 200);
   db.exec(`
     PRAGMA journal_mode = WAL;
     PRAGMA foreign_keys = ON;
+    PRAGMA busy_timeout = 5000;
+    PRAGMA wal_autocheckpoint = 250;
+    PRAGMA journal_size_limit = 16777216;
     CREATE TABLE IF NOT EXISTS scans (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collected_at TEXT NOT NULL,
@@ -19,35 +24,6 @@ export async function createStore(dataDir) {
       evidence_path TEXT NOT NULL
     );
     CREATE INDEX IF NOT EXISTS scans_collected_at_idx ON scans(collected_at DESC);
-    CREATE TABLE IF NOT EXISTS semantic_audits (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      scan_id INTEGER,
-      project_id TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      status TEXT NOT NULL,
-      packet_hash TEXT,
-      packet_path TEXT,
-      result_path TEXT,
-      audit_json TEXT,
-      error TEXT,
-      FOREIGN KEY(scan_id) REFERENCES scans(id)
-    );
-    CREATE INDEX IF NOT EXISTS semantic_audits_project_idx
-      ON semantic_audits(project_id, id DESC);
-    CREATE TABLE IF NOT EXISTS interventions (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      semantic_audit_id INTEGER NOT NULL UNIQUE,
-      project_id TEXT NOT NULL,
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      status TEXT NOT NULL,
-      prompt_text TEXT NOT NULL,
-      session_id TEXT,
-      sent_at TEXT,
-      note TEXT,
-      FOREIGN KEY(semantic_audit_id) REFERENCES semantic_audits(id)
-    );
-    CREATE INDEX IF NOT EXISTS interventions_status_idx
-      ON interventions(status, id DESC);
     CREATE TABLE IF NOT EXISTS gpu_queue_snapshots (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       collected_at TEXT NOT NULL,
@@ -77,13 +53,6 @@ export async function createStore(dataDir) {
     );
     CREATE INDEX IF NOT EXISTS automation_events_status_idx
       ON automation_events(status, id DESC);
-    CREATE TABLE IF NOT EXISTS automation_policies (
-      target_id TEXT PRIMARY KEY,
-      enabled INTEGER NOT NULL DEFAULT 0,
-      objective TEXT NOT NULL DEFAULT '',
-      created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
-      updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
     CREATE TABLE IF NOT EXISTS project_progress (
       target_id TEXT PRIMARY KEY,
       stage TEXT NOT NULL DEFAULT '',
@@ -172,10 +141,6 @@ export async function createStore(dataDir) {
       FOREIGN KEY(run_id) REFERENCES jobs(run_id)
     );
     CREATE INDEX IF NOT EXISTS job_events_run_idx ON job_events(run_id, id ASC);
-    CREATE TABLE IF NOT EXISTS system_migrations (
-      migration_key TEXT PRIMARY KEY,
-      applied_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
-    );
   `);
   const outboxColumns = new Set(db.prepare('PRAGMA table_info(message_outbox)').all()
     .map((column) => column.name));
@@ -186,24 +151,6 @@ export async function createStore(dataDir) {
     db.exec('ALTER TABLE message_outbox ADD COLUMN last_enter_at TEXT');
   }
   db.exec(`
-    UPDATE interventions
-    SET status = 'SUPERSEDED', note = 'superseded_by_newer_pending_intervention'
-    WHERE status IN ('PROPOSED', 'HELD')
-      AND id NOT IN (
-        SELECT MAX(id) FROM interventions
-        WHERE status IN ('PROPOSED', 'HELD')
-        GROUP BY project_id
-      );
-    CREATE UNIQUE INDEX IF NOT EXISTS interventions_one_pending_project_idx
-      ON interventions(project_id)
-      WHERE status IN ('PROPOSED', 'HELD');
-
-    UPDATE automation_events
-    SET status = 'RESOLVED', updated_at = CURRENT_TIMESTAMP,
-        note = 'replaced_by_stateless_codex_professor_engine'
-    WHERE event_type IN ('PROFESSOR_REVIEW_AVAILABLE', 'PROFESSOR_AUTH_REQUIRED')
-      AND status IN ('PENDING', 'HELD', 'DELIVERED');
-
     UPDATE message_outbox
     SET status = 'UNCERTAIN', updated_at = CURRENT_TIMESTAMP,
         error = COALESCE(error, 'process_restarted_during_transport_send')
@@ -215,31 +162,6 @@ export async function createStore(dataDir) {
         SELECT MAX(id) FROM job_events WHERE event_type = 'updated' GROUP BY run_id
       );
   `);
-  const singleTrackMigration = db.prepare(`
-    SELECT migration_key FROM system_migrations
-    WHERE migration_key = 'single_track_job_registry_v1'
-  `).get();
-  if (!singleTrackMigration) {
-    db.exec(`
-      BEGIN IMMEDIATE;
-      UPDATE automation_events
-      SET status = 'RESOLVED', updated_at = CURRENT_TIMESTAMP,
-          note = 'superseded_by_single_track_job_registry_migration'
-      WHERE event_type IN ('GPU_RESULT_READY', 'GPU_WAIT_ACCEPTED')
-        AND status IN ('PENDING', 'HELD', 'SENT');
-      UPDATE message_outbox
-      SET status = 'SUPERSEDED', updated_at = CURRENT_TIMESTAMP,
-          error = 'superseded_by_single_track_job_registry_migration'
-      WHERE status = 'UNCERTAIN'
-         OR automation_event_id IN (
-           SELECT id FROM automation_events
-           WHERE event_type IN ('GPU_RESULT_READY', 'GPU_WAIT_ACCEPTED')
-         );
-      INSERT INTO system_migrations (migration_key)
-      VALUES ('single_track_job_registry_v1');
-      COMMIT;
-    `);
-  }
   const insert = db.prepare(`
     INSERT INTO scans (collected_at, snapshot_json, audit_json, evidence_hash, evidence_path)
     VALUES (?, ?, ?, ?, ?)
@@ -249,53 +171,9 @@ export async function createStore(dataDir) {
     FROM scans ORDER BY id DESC LIMIT ?
   `);
   const get = db.prepare('SELECT * FROM scans WHERE id = ?');
-  const insertSemantic = db.prepare(`
-    INSERT INTO semantic_audits
-      (scan_id, project_id, status, packet_hash, packet_path, result_path, audit_json, error)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-  `);
-  const listSemantic = db.prepare(`
-    SELECT * FROM semantic_audits ORDER BY id DESC LIMIT ?
-  `);
-  const listSemanticByProject = db.prepare(`
-    SELECT * FROM semantic_audits WHERE project_id = ? ORDER BY id DESC LIMIT ?
-  `);
-  const getSemantic = db.prepare('SELECT * FROM semantic_audits WHERE id = ?');
-  const insertIntervention = db.prepare(`
-    INSERT OR IGNORE INTO interventions
-      (semantic_audit_id, project_id, status, prompt_text, note)
-    VALUES (?, ?, ?, ?, ?)
-  `);
-  const pendingIntervention = db.prepare(`
-    SELECT * FROM interventions
-    WHERE project_id = ? AND status IN ('PROPOSED', 'HELD')
-    ORDER BY id DESC LIMIT 1
-  `);
-  const refreshPendingIntervention = db.prepare(`
-    UPDATE interventions
-    SET semantic_audit_id = ?, status = 'PROPOSED', prompt_text = ?,
-        session_id = NULL, sent_at = NULL, note = ?
-    WHERE id = ?
-  `);
-  const pendingInterventionWithAudit = db.prepare(`
-    SELECT interventions.*, semantic_audits.packet_hash AS source_packet_hash
-    FROM interventions
-    JOIN semantic_audits ON semantic_audits.id = interventions.semantic_audit_id
-    WHERE interventions.project_id = ?
-      AND interventions.status IN ('PROPOSED', 'HELD')
-    ORDER BY interventions.id DESC LIMIT 1
-  `);
-  const listInterventions = db.prepare(`
-    SELECT * FROM interventions ORDER BY id DESC LIMIT ?
-  `);
-  const getIntervention = db.prepare('SELECT * FROM interventions WHERE id = ?');
-  const updateIntervention = db.prepare(`
-    UPDATE interventions SET status = ?, session_id = ?, sent_at = ?, note = ? WHERE id = ?
-  `);
-  const lastSentIntervention = db.prepare(`
-    SELECT * FROM interventions
-    WHERE project_id = ? AND status = 'SENT'
-    ORDER BY id DESC LIMIT 1
+  const pruneScans = db.prepare(`
+    DELETE FROM scans
+    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
   `);
   const insertGpuQueueSnapshot = db.prepare(`
     INSERT INTO gpu_queue_snapshots (collected_at, status, snapshot_json)
@@ -303,6 +181,12 @@ export async function createStore(dataDir) {
   `);
   const latestGpuQueueSnapshot = db.prepare(`
     SELECT * FROM gpu_queue_snapshots ORDER BY id DESC LIMIT 1
+  `);
+  const pruneGpuQueueSnapshots = db.prepare(`
+    DELETE FROM gpu_queue_snapshots
+    WHERE id NOT IN (
+      SELECT id FROM gpu_queue_snapshots ORDER BY id DESC LIMIT ?
+    )
   `);
   const insertAutomationEvent = db.prepare(`
     INSERT OR IGNORE INTO automation_events
@@ -324,20 +208,6 @@ export async function createStore(dataDir) {
     SET status = ?, updated_at = CURRENT_TIMESTAMP, session_id = ?, delivered_at = ?, note = ?
     WHERE id = ?
   `);
-  const upsertAutomationPolicy = db.prepare(`
-    INSERT INTO automation_policies (target_id, enabled, objective)
-    VALUES (?, ?, ?)
-    ON CONFLICT(target_id) DO UPDATE SET
-      enabled = excluded.enabled,
-      objective = excluded.objective,
-      updated_at = CURRENT_TIMESTAMP
-  `);
-  const listAutomationPolicies = db.prepare(`
-    SELECT * FROM automation_policies ORDER BY target_id ASC
-  `);
-  const getAutomationPolicy = db.prepare(`
-    SELECT * FROM automation_policies WHERE target_id = ?
-  `);
   const upsertProjectProgress = db.prepare(`
     INSERT INTO project_progress (target_id, stage, summary, reviewed_at, source)
     VALUES (?, ?, ?, ?, ?)
@@ -353,14 +223,6 @@ export async function createStore(dataDir) {
   `);
   const listProjectProgress = db.prepare(`
     SELECT * FROM project_progress ORDER BY target_id ASC
-  `);
-  const recentGoalActions = db.prepare(`
-    SELECT COUNT(*) AS count, MAX(delivered_at) AS last_delivered_at
-    FROM automation_events
-    WHERE category = 'goal_loop'
-      AND target_id = ?
-      AND status = 'DELIVERED'
-      AND delivered_at >= ?
   `);
   const insertOutboxMessage = db.prepare(`
     INSERT OR IGNORE INTO message_outbox
@@ -470,37 +332,6 @@ export async function createStore(dataDir) {
   `);
   const listJobEvents = db.prepare('SELECT * FROM job_events WHERE run_id = ? ORDER BY id ASC');
 
-  function semanticRow(row) {
-    if (!row) return null;
-    return {
-      id: Number(row.id),
-      scanId: row.scan_id === null ? null : Number(row.scan_id),
-      projectId: row.project_id,
-      createdAt: row.created_at,
-      status: row.status,
-      packetHash: row.packet_hash,
-      packetPath: row.packet_path,
-      resultPath: row.result_path,
-      audit: row.audit_json ? JSON.parse(row.audit_json) : null,
-      error: row.error,
-    };
-  }
-
-  function interventionRow(row) {
-    if (!row) return null;
-    return {
-      id: Number(row.id),
-      semanticAuditId: Number(row.semantic_audit_id),
-      projectId: row.project_id,
-      createdAt: row.created_at,
-      status: row.status,
-      promptText: row.prompt_text,
-      sessionId: row.session_id,
-      sentAt: row.sent_at,
-      note: row.note,
-    };
-  }
-
   function automationEventRow(row) {
     if (!row) return null;
     return {
@@ -520,17 +351,6 @@ export async function createStore(dataDir) {
       sessionId: row.session_id,
       deliveredAt: row.delivered_at,
       note: row.note,
-    };
-  }
-
-  function automationPolicyRow(row) {
-    if (!row) return null;
-    return {
-      targetId: row.target_id,
-      enabled: Boolean(row.enabled),
-      objective: row.objective,
-      createdAt: row.created_at,
-      updatedAt: row.updated_at,
     };
   }
 
@@ -617,6 +437,7 @@ export async function createStore(dataDir) {
         evidence.bundleHash,
         evidence.directory,
       );
+      pruneScans.run(scanRetention);
       return Number(result.lastInsertRowid);
     },
     list(limit = 50) {
@@ -642,82 +463,13 @@ export async function createStore(dataDir) {
         audit: JSON.parse(row.audit_json),
       };
     },
-    saveSemanticAudit(scanId, projectId, result) {
-      const inserted = insertSemantic.run(
-        scanId ?? null,
-        projectId,
-        result.status,
-        result.packetHash ?? null,
-        result.packetPath ?? null,
-        result.resultPath ?? null,
-        result.audit ? JSON.stringify(result.audit) : null,
-        result.error ?? null,
-      );
-      return Number(inserted.lastInsertRowid);
-    },
-    listSemanticAudits(limit = 50, projectId = null) {
-      const bounded = Math.max(1, Math.min(Number(limit) || 50, 500));
-      const rows = projectId
-        ? listSemanticByProject.all(projectId, bounded)
-        : listSemantic.all(bounded);
-      return rows.map(semanticRow);
-    },
-    getSemanticAudit(id) {
-      return semanticRow(getSemantic.get(Number(id)));
-    },
-    latestSemanticAudit(projectId) {
-      return semanticRow(listSemanticByProject.get(projectId, 1));
-    },
-    createIntervention(semanticAuditId, projectId, promptText, note = null) {
-      const pending = pendingIntervention.get(projectId);
-      if (pending) {
-        refreshPendingIntervention.run(
-          semanticAuditId,
-          promptText,
-          note || 'refreshed_from_newer_high_confidence_audit',
-          pending.id,
-        );
-        return interventionRow(getIntervention.get(pending.id));
-      }
-      insertIntervention.run(semanticAuditId, projectId, 'PROPOSED', promptText, note);
-      const row = db.prepare('SELECT * FROM interventions WHERE semantic_audit_id = ?')
-        .get(semanticAuditId);
-      return interventionRow(row);
-    },
-    clearPendingIntervention(projectId, { semanticAuditId, packetHash, verdict }) {
-      const pending = pendingInterventionWithAudit.get(projectId);
-      if (!pending || !packetHash || pending.source_packet_hash === packetHash) {
-        return pending ? interventionRow(pending) : null;
-      }
-      updateIntervention.run(
-        'CLEARED',
-        null,
-        null,
-        `cleared_by_newer_${String(verdict || 'nonintervention').toLowerCase()}_audit:${semanticAuditId}`,
-        pending.id,
-      );
-      return interventionRow(getIntervention.get(pending.id));
-    },
-    listInterventions(limit = 50) {
-      return listInterventions.all(Math.max(1, Math.min(Number(limit) || 50, 500)))
-        .map(interventionRow);
-    },
-    getIntervention(id) {
-      return interventionRow(getIntervention.get(Number(id)));
-    },
-    setIntervention(id, { status, sessionId = null, sentAt = null, note = null }) {
-      updateIntervention.run(status, sessionId, sentAt, note, Number(id));
-      return interventionRow(getIntervention.get(Number(id)));
-    },
-    lastSentIntervention(projectId) {
-      return interventionRow(lastSentIntervention.get(projectId));
-    },
     saveGpuQueueSnapshot(snapshot) {
       const inserted = insertGpuQueueSnapshot.run(
         snapshot.collectedAt,
         snapshot.status,
         JSON.stringify(snapshot),
       );
+      pruneGpuQueueSnapshots.run(gpuSnapshotRetention);
       return Number(inserted.lastInsertRowid);
     },
     latestGpuQueueSnapshot() {
@@ -729,6 +481,15 @@ export async function createStore(dataDir) {
         createdAt: row.created_at,
         status: row.status,
         snapshot: JSON.parse(row.snapshot_json),
+      };
+    },
+    pruneHistory() {
+      const scans = pruneScans.run(scanRetention);
+      const gpuSnapshots = pruneGpuQueueSnapshots.run(gpuSnapshotRetention);
+      db.exec('PRAGMA wal_checkpoint(PASSIVE)');
+      return {
+        scansDeleted: Number(scans.changes),
+        gpuSnapshotsDeleted: Number(gpuSnapshots.changes),
       };
     },
     createAutomationEvent(event) {
@@ -770,16 +531,6 @@ export async function createStore(dataDir) {
       updateAutomationEvent.run(status, sessionId, deliveredAt, note, Number(id));
       return automationEventRow(getAutomationEventById.get(Number(id)));
     },
-    setAutomationPolicy(targetId, { enabled, objective }) {
-      upsertAutomationPolicy.run(targetId, enabled ? 1 : 0, objective);
-      return automationPolicyRow(getAutomationPolicy.get(targetId));
-    },
-    getAutomationPolicy(targetId) {
-      return automationPolicyRow(getAutomationPolicy.get(targetId));
-    },
-    listAutomationPolicies() {
-      return listAutomationPolicies.all().map(automationPolicyRow);
-    },
     setProjectProgress(targetId, { stage = '', summary, reviewedAt, source }) {
       upsertProjectProgress.run(targetId, stage, summary, reviewedAt, source);
       return projectProgressRow(getProjectProgress.get(targetId));
@@ -789,13 +540,6 @@ export async function createStore(dataDir) {
     },
     listProjectProgress() {
       return listProjectProgress.all().map(projectProgressRow);
-    },
-    recentGoalActions(targetId, since) {
-      const row = recentGoalActions.get(targetId, since);
-      return {
-        count: Number(row?.count || 0),
-        lastDeliveredAt: row?.last_delivered_at || null,
-      };
     },
     createOutboxMessage(message) {
       insertOutboxMessage.run(

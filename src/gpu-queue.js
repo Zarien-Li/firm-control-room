@@ -64,6 +64,7 @@ for state, signal in states:
         request = fields(request_text)
         result = fields(result_text)
         status_json = safe_json(os.path.join(entry.path, "status.json"))
+        terminal_json = safe_json(os.path.join(entry.path, "terminal.json"))
         worker_alive = None
         if state == "running" and isinstance(status_json, dict):
             worker_pid = status_json.get("container_pid")
@@ -109,6 +110,7 @@ for state, signal in states:
             "summary": result.get("summary"),
             "nextAction": result.get("next_action_for_project_session"),
             "statusDetail": status_json,
+            "terminalDetail": terminal_json,
             "workerAlive": worker_alive,
             "telemetry": telemetry_json,
         })
@@ -132,6 +134,14 @@ function remoteCommand(root, dockerContainer = null) {
   return dockerContainer
     ? `docker exec ${quoteRemote(dockerContainer)} ${python}`
     : python;
+}
+
+function remoteRunnerEnsureCommand(root, dockerContainer = null, runnerPath = null) {
+  const runner = runnerPath || `${root.replace(/\/$/, '')}/firm_gpu_queue_runner.sh`;
+  const command = `${quoteRemote(runner)} --ensure`;
+  return dockerContainer
+    ? `docker exec ${quoteRemote(dockerContainer)} ${command}`
+    : command;
 }
 
 export function emptyGpuQueueSnapshot(status = 'disabled', error = null) {
@@ -181,6 +191,26 @@ function normalizeTelemetry(value) {
     gpus,
     throughput,
     source: String(value.source || 'scheduler').slice(0, 80),
+  };
+}
+
+function normalizeTerminalManifest(value) {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const state = String(value.state || '').toLowerCase();
+  if (!['done', 'failed', 'cancelled'].includes(state)) return null;
+  const exitCode = finiteNumber(value.exit_code ?? value.exitCode, 0, 255);
+  return {
+    protocolVersion: finiteNumber(value.protocol_version ?? value.protocolVersion, 1, 1000),
+    runner: String(value.runner || '').slice(0, 100) || null,
+    state,
+    exitCode,
+    finishedAt: typeof value.finished_at === 'string' ? value.finished_at
+      : (typeof value.finishedAt === 'string' ? value.finishedAt : null),
+    pid: finiteNumber(value.container_pid ?? value.pid, 1),
+    pidStartTicks: String((value.pid_start_ticks ?? value.pidStartTicks) || '').slice(0, 100) || null,
+    commandFingerprint: /^[a-f0-9]{64}$/.test(String(
+      value.command_fingerprint ?? value.commandFingerprint ?? '',
+    )) ? String(value.command_fingerprint ?? value.commandFingerprint) : null,
   };
 }
 
@@ -350,9 +380,13 @@ export function normalizeGpuQueueSnapshot(value) {
       nextAction: typeof item.nextAction === 'string' ? item.nextAction.slice(0, 4000) : null,
       statusDetail: item.statusDetail && typeof item.statusDetail === 'object'
         ? item.statusDetail : null,
+      terminal: normalizeTerminalManifest(item.terminalDetail),
       workerAlive: typeof item.workerAlive === 'boolean' ? item.workerAlive : null,
       telemetry: normalizeTelemetry(item.telemetry),
       };
+      normalized.terminalIntegrity = normalized.terminal
+        ? normalized.terminal.state === normalized.state ? 'MATCH' : 'MISMATCH'
+        : null;
       normalized.efficiency = classifyGpuEfficiency(
         normalized,
         Date.parse(value.collectedAt || '') || Date.now(),
@@ -384,6 +418,19 @@ export async function collectGpuQueue(config, options = {}) {
     remoteCommand(config.root, config.dockerContainer),
   ];
   try {
+    if (config.runnerEnsureEnabled) {
+      await run(config.sshExecutable, [
+        '-p', String(config.port),
+        '-o', 'BatchMode=yes',
+        '-o', `ConnectTimeout=${Math.max(1, Math.ceil(config.timeoutMs / 1000))}`,
+        config.host,
+        remoteRunnerEnsureCommand(config.root, config.dockerContainer, config.runnerPath),
+      ], {
+        timeout: config.timeoutMs,
+        maxBuffer: 1024 * 1024,
+        encoding: 'utf8',
+      });
+    }
     const { stdout } = await run(config.sshExecutable, args, {
       timeout: config.timeoutMs,
       maxBuffer: 8 * 1024 * 1024,
@@ -397,4 +444,4 @@ export async function collectGpuQueue(config, options = {}) {
   }
 }
 
-export const gpuQueueInternals = Object.freeze({ remoteCommand });
+export const gpuQueueInternals = Object.freeze({ remoteCommand, remoteRunnerEnsureCommand });

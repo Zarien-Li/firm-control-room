@@ -5,6 +5,7 @@ import {
   clearItermDraft,
   collectItermStatuses,
   dismissItermChoice,
+  selectItermChoice,
   sendItermMessage,
   submitItermDraft,
 } from '../src/iterm-status.js';
@@ -73,6 +74,40 @@ test('a 429 with a future reset time is a healthy rate-limit wait', () => {
     state: 'WAITING_INPUT',
     reason: 'claude_input_prompt_visible',
     lastRateLimitResetAt: '2026-08-11T16:17:28.000Z',
+  });
+});
+
+test('a provider 5xx is a silent transient, not a fresh Claude input point', () => {
+  const tail = [
+    'API Error: 529 overloaded. Retrying in 30 seconds.',
+    '❯ ',
+    '────────────────────────',
+    '  ⏵⏵ auto mode on',
+  ].join('\n');
+  assert.deepEqual(classifyItermTail(tail), {
+    state: 'PROVIDER_TRANSIENT',
+    reason: 'provider_temporary_failure',
+    retryAfterSeconds: 30,
+    providerFailureFingerprint: 'c0f6eeff8c013ab9f019b7f70db60a18b06cac293e7751c25e0a6372a40dde14',
+  });
+  assert.equal(classifyItermTail(`${tail}\n✽ Continuing the current turn…`).state, 'WORKING');
+});
+
+test('a later 429 reset wins over stale 529 and FIRM recovery text', () => {
+  const tail = [
+    'API Error: 529 overloaded. Retrying in 30 seconds.',
+    '[FIRM OPERATIONAL RECOVERY] The preceding provider failure has reached its retry point.',
+    'API Error: Request rejected (429) · [1308][已达到 5小时的使用上限。您的限额将在 2026-08-1200:17:28重置。',
+    '❯ ',
+    '────────────────────────',
+    '  ⏵⏵ auto mode on',
+  ].join('\n');
+  assert.deepEqual(classifyItermTail(tail, {
+    now: new Date('2026-08-11T16:00:00Z'),
+  }), {
+    state: 'RATE_LIMITED',
+    reason: 'api_rate_limit_wait',
+    resetAt: '2026-08-11T16:17:28.000Z',
   });
 });
 
@@ -235,6 +270,18 @@ test('draft clear and choice dismiss are separate terminal actions', async () =>
   assert.equal(calls.length, 2);
   assert.ok(calls[0].lines.some((line) => /ASCII character 3/.test(line)));
   assert.ok(calls[1].lines.some((line) => /ASCII character 27/.test(line)));
+});
+
+test('routine choice selection navigates from the visible item and submits once', async () => {
+  const calls = [];
+  const result = await selectItermChoice('/dev/ttys019', 1, 3, {
+    runWrite: async (lines, argv) => calls.push({ lines, argv }),
+  });
+  assert.equal(result.ok, true);
+  assert.equal(calls.length, 1);
+  assert.deepEqual(calls[0].argv, ['/dev/ttys019', '1', '3']);
+  assert.ok(calls[0].lines.some((line) => /targetChoice - currentChoice/.test(line)));
+  assert.ok(calls[0].lines.some((line) => /ASCII character 13/.test(line)));
 });
 
 test('collapsed bracketed paste is a draft that needs Enter, not a fresh prompt', () => {

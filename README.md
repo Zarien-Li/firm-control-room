@@ -9,7 +9,7 @@
 [![macOS](https://img.shields.io/badge/platform-macOS-111111)](https://www.apple.com/macos/)
 [![MIT](https://img.shields.io/badge/license-MIT-2f81f7)](LICENSE)
 
-**One local dashboard for launching, observing, continuing, auditing, and safely re-anchoring parallel AI research sessions.**
+**One local operations plane for observing parallel research sessions and long-running jobs without becoming a second PI.**
 
 [Quick start](#5-minute-quick-start) · [How it works](#how-it-works) · [GPU integration](#optional-gpu-queue) · [中文说明](README.zh-CN.md)
 
@@ -19,16 +19,16 @@
 
 Opening more terminals is easy. Knowing whether nine research agents are genuinely working, waiting on a valid experiment, silently stopped, or drifting into a low-value side problem is not.
 
-FIRM turns those hidden states into an evidence-backed control plane. It combines the Claude history stream, terminal state, process tree, project artifacts, persistent delivery acknowledgements, optional GPU queue signals, and short-lived Codex boundary audits. It can keep approved goals moving without granting a reviewer model authority over the science.
+FIRM turns those hidden states into an evidence-backed control plane. It combines the Claude history stream, terminal state, process tree, project artifacts, a durable Job Registry, optional GPU queue signals, and an optional event-driven Continuity PI. The Continuity PI resumes genuinely idle research turns; it is separate from scientific portfolio review and is forbidden to invent a replacement method or change a paper's direction.
 
 ## Why FIRM
 
 | Without a control plane | With FIRM |
 |---|---|
-| A prompt is visible, but you cannot tell whether Claude stopped or a tool is still draining | Explicit states such as `MODEL_WORKING`, `TOOL_RUNNING`, `WAITING_FOR_JOB`, and `WAITING_REVIEW` |
+| A prompt is visible, but you cannot tell whether Claude stopped or a tool is still draining | Explicit states such as `MODEL_WORKING`, `TOOL_RUNNING`, `WAITING_FOR_JOB`, and `READY_FOR_INPUT` |
 | “Continue” messages may be pasted twice or never submitted | Durable outbox, unique delivery markers, and Claude-history acknowledgement |
-| A long-running session gradually replaces the original research program | Read-only evidence snapshots plus isolated Codex boundary audits |
-| A reviewer agent starts inventing extra experiments and steering the PI | Codex may identify scope drift, but cannot choose methods, claims, pivots, or GPU actions |
+| A project finishes one turn and silently waits forever | A stable, genuinely idle prompt gets one AI continuity decision; healthy jobs and tools stay silent |
+| Repeated recovery text fragments a construction episode | 529 stays passive; an explicit 429 reset permits one durable Enter-only resume |
 | GPU workers start before data, dependencies, and evaluation code are ready | Optional readiness gate, queue lifecycle, phase-aware telemetry, and result wake-up |
 | A session waiting for an experiment is mistaken for an abandoned session | GPU waits require an exact run ID that is independently verified as active and project-owned |
 
@@ -36,14 +36,13 @@ FIRM turns those hidden states into an evidence-backed control plane. It combine
 
 - **Persistent Claude sessions**: a broker owns PTYs, so a browser or web-process restart does not kill the research agent.
 - **External iTerm discovery**: existing Claude Code processes are mapped to projects by verified working directory.
-- **Goal Loop**: explicit per-project authorization, user-defined objectives, bounded continuation, and a rolling daily limit.
-- **AI Session Resolver**: every new, stable Claude input episode is read by a short-lived Codex process. Codex freely decides whether a response is useful and writes the exact response; FIRM does not classify the episode with a hand-built error or boundary taxonomy.
-- **Research-boundary auditing**: periodic portfolio review remains a separate, read-only control surface.
+- **One continuity owner**: optional short-lived Codex decisions resume stable idle prompts without running a second scientific program.
+- **External review boundary**: scientific portfolio review belongs to a separately configured reviewer or to the project PI, outside FIRM.
 - **Reliable delivery**: external messages move through `QUEUED → SENDING → SENT_AWAITING_ACK → DELIVERED`.
 - **GPU-aware waiting**: a project can legitimately stop while its declared `pending/running` experiment is active; terminal results wake it again.
 - **Operational honesty**: ambiguous terminals, missing observability, stale progress, permission prompts, and policy holds remain distinct states.
 
-FIRM does **not** let the dashboard execute arbitrary shell commands. It does not let Codex decide that a method is bad, that a field is exhausted, or that a paper should pivot. It never terminates a GPU worker from utilization alone.
+FIRM does **not** let the dashboard execute arbitrary shell commands. It cannot decide that a method is bad, that a field is exhausted, or that a paper should pivot. It never terminates a GPU worker from utilization alone.
 
 ## 5-minute quick start
 
@@ -52,7 +51,6 @@ FIRM does **not** let the dashboard execute arbitrary shell commands. It does no
 - macOS (external iTerm control is macOS-specific)
 - Node.js 26+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) installed and logged in
-- Codex CLI installed and logged in if you want independent audits; otherwise disable them
 
 ### 1. Install
 
@@ -94,12 +92,6 @@ npm start
 
 Open [http://127.0.0.1:8787](http://127.0.0.1:8787). Click **Start Claude**, or keep using an existing iTerm Claude session inside the configured project directory and let FIRM discover it.
 
-To run without Codex audits:
-
-```bash
-FIRM_CODEX_AUDIT_ENABLED=false npm start
-```
-
 ## How it works
 
 ```mermaid
@@ -110,7 +102,7 @@ flowchart LR
     WEB --> EVIDENCE["Read-only project evidence"]
     WEB --> HISTORY["Claude JSONL + process heartbeat"]
     WEB --> LEDGER["SQLite episodes + delivery outbox"]
-    WEB --> CODEX["Ephemeral Codex boundary auditor"]
+    WEB --> CONTINUITY["Continuity PI (idle prompts only)"]
     WEB -. optional .-> QUEUE["Remote GPU queue"]
     QUEUE --> SCHEDULER["GPU Scheduler session"]
     QUEUE --> CLAUDE
@@ -127,19 +119,17 @@ FIRM derives session state from four independent signals:
 
 That distinction matters. A spinner with no history, artifact, or tool progress is not silently called “working.” A visible prompt while a child process drains is not silently called “stopped.”
 
-### Safe continuation
+### Operational delivery boundary
 
-Automatic Goal Loop injection is globally off by default. Each newly stopped episode is handed to the Research Session Resolver together with the current terminal episode, latest Claude response, active tools, construction lease, registered jobs, and the persistent research-authority block from the project's `CLAUDE.md`. Codex acts as another PI: it may answer a question, choose among options, recover interrupted work, schedule a recheck, or remain silent. Research decisions are autonomous; only external-rights actions such as credentials, payment, legal commitments, irreversible deletion, formal submission, or public release require owner authorization. Resolver transport failures remain visible and retry automatically instead of becoming silently resolved events.
+FIRM may deliver only allowlisted structured job facts: a registered job reached `done`, `failed`, or `cancelled`; a GPU submission is structurally incomplete; or the GPU control session received a queue/monitor event. Research sessions receive a compact JSON envelope, never an interpretation or a suggested next experiment. Every delivery has a durable unique marker and requires Claude-history acknowledgement, preventing restart-time replay.
 
-An external iTerm message is not considered delivered merely because AppleScript pasted it. The Claude history must contain its unique `[FIRM DELIVERY ...]` marker. Uncertain sends are exposed instead of retried blindly.
+Provider recovery is similarly narrow. A 529 is recorded and left alone. A 429 with an explicit reset timestamp permits one Enter-only resume after that time; the event is persisted before the keypress so a supervisor restart cannot repeat it.
 
-### Codex Professor Engine
+### Research continuity boundary
 
-Codex is invoked as a short-lived, read-only boundary auditor, not a permanent co-PI session. Each audit starts from project authority and recent bounded evidence. It may flag identity, scope, evidence, compute, or operational drift. It may not prescribe a method, add a baseline, invent a paper framing, or turn ordinary uncertainty into a stop decision.
+When a configured research session is stably at an input prompt, has no active tool, and is not waiting for an exact active Job Registry run, FIRM may launch one ephemeral read-only Codex process. FIRM supplies only bounded copies of `CLAUDE.md`, `PROGRAM_ORIGIN.md`, `SEED.md`, and `PIPELINE_STATE.md` plus the current session and Registry facts. Codex runs from an empty temporary directory and cannot browse the research repository. It returns one of five decisions: continue, choose an ordinary visible option, wait, complete, or owner required. Routine scientific judgment belongs to the AI researchers; owner escalation is reserved for irreversible deletion, credentials, payment, legal commitments, formal submission, publication, or another explicit external-rights boundary.
 
-For deployments that use a separate portfolio-review scheduler, set `FIRM_SCAN_INTERVAL_MS=0` and `FIRM_CODEX_AUDIT_ENABLED=false`. This leaves FIRM responsible for session liveness, structured job state, and operational events while the external scheduler remains the single owner of periodic scientific review. Manual audit endpoints remain available when explicitly enabled.
-
-The default re-anchor mode is `auto`: high-confidence, grounded interventions are delivered directly. This does not grant authority for external-rights actions, which remain explicit owner decisions.
+The continuity process cannot edit project files, run tools, conduct portfolio review, or prescribe a new method. A continue decision is delivered through the same durable outbox and Claude-history acknowledgement path as job results. One session episode receives at most one decision, and resolver failures remain retryable instead of being silently treated as completion.
 
 ## Optional GPU queue
 
@@ -199,17 +189,11 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 | `FIRM_CONFIG` | `config/projects.json` | Project configuration file |
 | `FIRM_HOST` | `127.0.0.1` | Local bind address |
 | `FIRM_PORT` | `8787` | Dashboard port |
-| `FIRM_CODEX_AUDIT_ENABLED` | `true` | Enable isolated Codex audits |
-| `FIRM_OPERATIONAL_RESOLVER_ENABLED` | `true` | Let Codex inspect every new stable Claude input episode and decide whether to respond |
-| `FIRM_OPERATIONAL_RESOLVER_TIMEOUT_MS` | `600000` | Per-episode Research Session Resolver timeout; unresolved failures remain visible and retry |
-| `FIRM_OPERATIONAL_RESOLVER_ATTEMPTS` | `2` | Immediate fresh-process attempts before durable backoff |
-| `FIRM_OPERATIONAL_RESOLVER_MAX_CONCURRENCY` | `2` | Bounded resolver workers; prevents restart-time connection stampedes |
-| `FIRM_OPERATIONAL_MESSAGE_COOLDOWN_MS` | `300000` | Minimum interval between AI messages to the same project |
-| `FIRM_OPERATIONAL_MAX_MESSAGES_PER_HOUR` | `3` | Delivery safety budget per project; it does not constrain Codex's reasoning |
-| `FIRM_SCAN_INTERVAL_MS` | `9000000` | Periodic audit interval (2.5 hours) |
-| `FIRM_REANCHOR_MODE` | `auto` | `off`, `approval`, or `auto` |
-| `FIRM_GOAL_LOOP_ENABLED` | `false` | Global kill switch for generic automatic continuation |
-| `FIRM_GOAL_MAX_CONTINUES_PER_DAY` | `48` | Hard rolling 24-hour continuation limit per project |
+| `FIRM_SCAN_RETENTION` | `50` | Maximum bulky raw control-room snapshots retained locally |
+| `FIRM_GPU_SNAPSHOT_RETENTION` | `200` | Maximum bulky raw GPU queue snapshots retained locally |
+| `FIRM_BROKER_SOCKET` | `<data-dir>/control-plane/broker.sock` | Stable Unix socket for the persistent PTY broker |
+| `FIRM_BROKER_AUTOSTART` | `true` | Development fallback; the macOS service sets this to `false` and uses a separate broker LaunchAgent |
+| `FIRM_SCAN_INTERVAL_MS` | `9000000` | Periodic read-only evidence snapshot interval |
 | `FIRM_GPU_QUEUE_ENABLED` | `false` | Enable remote queue collection |
 | `FIRM_GPU_SCHEDULER_AUTO_START` | `false` | Allow a configured scheduler target to start for new requests |
 | `FIRM_DATA_DIR` | `./var` | Local runtime database, evidence, and transcripts |
@@ -225,14 +209,15 @@ npm run smoke
 npm run acceptance:restart
 ```
 
-The test suite covers broker/web restarts, delayed acknowledgements, interrupted sends, terminal noise, fast work cycles, collector degradation, GPU monitor loss, valid GPU waits, and duplicate-delivery prevention.
+The test suite covers broker/web restarts, bounded SQLite history, delayed acknowledgements, interrupted sends, terminal noise, collector degradation, GPU monitor loss, valid job waits, duplicate-delivery prevention, and the separation between continuity decisions and scientific portfolio authority.
 
 ## Security model
 
 - The server binds to localhost by default and has no multi-user authentication. Do not expose it directly to a network.
 - Project collection is allowlisted and read-only; FIRM runtime data goes under `var/`.
 - Web APIs select only configured projects, fixed executables, fixed arguments, and fixed working directories.
-- Codex runs read-only and receives project/session text as untrusted evidence.
+- Codex continuity runs in an empty read-only sandbox and receives only four bounded authority files plus untrusted session text as evidence, never as instructions.
+- Waiting prompts trigger continuity only after tool and Job Registry evidence rule out healthy work.
 - Queue free text is never injected directly as a research instruction.
 - The only normal Claude termination path is an explicit user stop action.
 - `var/`, `work/`, local project configuration, logs, and environment files are excluded from Git.

@@ -5,30 +5,24 @@ import { pathToFileURL } from 'node:url';
 import { WebSocketServer } from 'ws';
 import { auditSnapshot } from './audit.js';
 import { AutomationEngine } from './automation-engine.js';
-import { runCodexOperationalResolver } from './operational-resolver.js';
 import { BrokerClient } from './broker-client.js';
-import { readClaudeHistoryHeartbeat, readRecentClaudeActivity } from './claude-history.js';
+import { readRecentClaudeActivity } from './claude-history.js';
 import { collectClaudeSessions, collectSnapshot } from './collectors.js';
 import { loadConfig } from './config.js';
 import { createEvidenceBundle, verifyEvidenceBundle } from './evidence.js';
 import {
   clearItermDraft,
-  dismissItermChoice,
+  selectItermChoice,
   sendItermMessage,
   submitItermDraft,
 } from './iterm-status.js';
 import { SessionError } from './session-manager.js';
 import { deriveOperationalState } from './session-state.js';
-import {
-  buildReanchorPrompt,
-  buildSemanticPacket,
-  reanchorEligible,
-  runCodexSemanticAudit,
-  semanticPacketHash,
-} from './semantic-audit.js';
 import { createStore } from './store.js';
 import { JobRegistry } from './job-registry.js';
 import { activeJobs } from './job-wait.js';
+import { CodexContinuityResolver } from './continuity-resolver.js';
+import { ContinuitySupervisor } from './continuity-supervisor.js';
 
 const mime = {
   '.html': 'text/html; charset=utf-8',
@@ -56,25 +50,6 @@ function sendError(res, status, code, message) {
   return sendJson(res, status, { error: { code, message } });
 }
 
-function interventionView(store, intervention) {
-  const audit = store.getSemanticAudit(intervention.semanticAuditId)?.audit;
-  const evidence = (audit?.evidence || [])
-    .filter((item) => item.verified === true)
-    .map(({ source, sourceKind, sourceLabel, quote, reason }) => ({
-      source, sourceKind, sourceLabel, quote, reason,
-    }));
-  return {
-    ...intervention,
-    evidence,
-    grounding: audit?.grounding ? {
-      verifiedCount: audit.grounding.verifiedCount,
-      hasAuthority: audit.grounding.hasAuthority,
-      hasSession: audit.grounding.hasSession,
-      eligible: audit.grounding.eligible,
-    } : null,
-  };
-}
-
 function compactActivityText(value, maximum = 900) {
   const text = String(value || '').replace(/\s+/g, ' ').trim();
   return text.length > maximum ? `${text.slice(0, maximum - 1)}…` : text;
@@ -89,19 +64,6 @@ function compactIncomingText(value, maximum = 600) {
     .replace(/This came from another Claude session[\s\S]*$/i, '')
     .replace(/<[^>]+>/g, ' ');
   return compactActivityText(text, maximum);
-}
-
-function externalContinuationPrompt() {
-  return [
-    '[FIRM RESEARCH CONTINUATION]',
-    '继续自主推进当前已锁定研究目标。以当前可信证据和最新 active research skills 为依据，在同一 turn 内连续完成一组相互连贯的高价值动作；每完成一个常规动作后重新判断并继续下一个独立动作。',
-    'GPU 尚未 compute-ready 时，继续完成所有可并行的 CPU、代码、数据、解释和 baseline 工作。',
-    '所有未来 GPU 作业必须先准备 compute-ready 的远端 command 文件，再调用 FIRM 安装目录中的 scripts/submit-gpu-request.sh；不得自行选择 CUDA_VISIBLE_DEVICES 或通过 SSH/Docker 直接启动新 GPU worker。后续等待标记必须使用提交工具返回的规范 RUN_ID。',
-    '所有本地 CPU、远端 CPU、SSH 和其他长任务必须通过 scripts/run-registered-job.sh 启动，或通过 /api/jobs 显式注册和更新；不得让 FIRM 猜测进程状态。',
-    '只有在所有独立工作都完成、且唯一阻塞是 Registry 中仍为 pending/running 的任务时，才以精确机器标记 [FIRM WAITING_FOR_JOB run_id=<active_run_id>] 结束。这是唯一受支持的等待标记；不得为已失败、已完成、缺失或仅计划中的请求输出等待标记。',
-    '不要因为完成一次实验、状态记录、请求包、代码修复或证据读取就结束本 turn；不要扩大 sealed arena，不把候选失败改写成 analysis-paper identity，不要返回常规菜单。',
-    '普通科研决策由你作为 PI 自主完成。仅在需要账号凭证、付费、接受法律或伦理条款、不可逆删除、正式投稿或公开发布等外部权利时暂停。',
-  ].join('\n');
 }
 
 async function readJson(req, { allowed, required = [] }) {
@@ -141,7 +103,9 @@ export async function createApp(overrides = {}) {
     externalSessionSender: suppliedExternalSessionSender,
     externalSessionSubmitter: suppliedExternalSessionSubmitter,
     externalSessionClearer: suppliedExternalSessionClearer,
-    externalSessionChoiceDismisser: suppliedExternalSessionChoiceDismisser,
+    externalSessionChooser: suppliedExternalSessionChooser,
+    continuityResolver: suppliedContinuityResolver,
+    continuitySupervisor: suppliedContinuitySupervisor,
     ...configOverrides
   } = overrides;
   const config = { ...(await loadConfig()), ...configOverrides };
@@ -156,7 +120,11 @@ export async function createApp(overrides = {}) {
         || ['CLAUDE-RESEARCH.md', project.bootstrapFile || 'prompt.txt'],
     }));
   }
-  const store = await createStore(config.dataDir);
+  const store = await createStore(config.dataDir, {
+    scanRetention: config.historyRetention?.scans,
+    gpuSnapshotRetention: config.historyRetention?.gpuSnapshots,
+  });
+  store.pruneHistory();
   const sessionManager = suppliedSessionManager
     || suppliedBrokerClient
     || new BrokerClient({ socketPath: config.brokerSocketPath });
@@ -176,16 +144,29 @@ export async function createApp(overrides = {}) {
   const externalSessionClearer = suppliedExternalSessionClearer || ((session) => (
     clearItermDraft(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
   ));
-  const externalSessionChoiceDismisser = suppliedExternalSessionChoiceDismisser || ((session) => (
-    dismissItermChoice(session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`)
+  const externalSessionChooser = suppliedExternalSessionChooser || ((session, current, target) => (
+    selectItermChoice(
+      session.tty?.startsWith('/dev/') ? session.tty : `/dev/${session.tty}`,
+      current,
+      target,
+    )
   ));
-  const operationalResolver = (project, session, jobs, reconciliationObligations = []) => (
-    runCodexOperationalResolver({
-      config, project, session, jobs, reconciliationObligations,
-    })
-  );
-  const stopReviewInFlight = new Map();
   const jobRegistry = new JobRegistry({ store });
+  const continuityResolver = suppliedContinuityResolver || (
+    config.continuity?.enabled
+      ? new CodexContinuityResolver({
+        executable: config.continuity.codexExecutable,
+        schemaPath: join(config.root, 'config', 'continuity-decision.schema.json'),
+        model: config.continuity.model,
+        timeoutMs: config.continuity.timeoutMs,
+      })
+      : null
+  );
+  const continuitySupervisor = suppliedContinuitySupervisor || (
+    config.continuity?.enabled
+      ? new ContinuitySupervisor({ config, store, resolver: continuityResolver })
+      : null
+  );
   const automationEngine = suppliedAutomationEngine || new AutomationEngine({
     config,
     store,
@@ -194,63 +175,16 @@ export async function createApp(overrides = {}) {
     externalSessionInput: externalSessionSender,
     externalSessionSubmit: externalSessionSubmitter,
     externalSessionClear: externalSessionClearer,
-    externalSessionDismissChoice: externalSessionChoiceDismisser,
-    operationalResolver,
-    // A normal Claude input prompt is a liveness event, not a scientific review
-    // event. Project sessions own milestone Codex calls; portfolio review is
-    // handled separately from the Goal Loop.
-    onExternalSessionStopped: null,
+    externalSessionChoose: externalSessionChooser,
     jobRegistry,
+    continuitySupervisor,
   });
   const publicDir = join(config.root, 'public');
   let scanPromise = null;
-  let semanticPromise = null;
-  let semanticTail = Promise.resolve();
-  let immediateSemanticTail = Promise.resolve();
   let scanTimer = null;
   let automationTimer = null;
   let controlStatusPromise = null;
   let controlStatusCache = null;
-
-  function collectProfessorStatus() {
-    const audits = store.listSemanticAudits(1000);
-    const latestByProject = new Map();
-    for (const audit of audits) {
-      if (!latestByProject.has(audit.projectId)) latestByProject.set(audit.projectId, audit);
-    }
-    const pendingInterventions = store.listInterventions(1000)
-      .filter((item) => ['PROPOSED', 'HELD'].includes(item.status));
-    const latestScan = store.list(1)[0] || null;
-    const lastCodexAudit = audits.find((item) => item.status === 'completed') || null;
-    const nextRunAt = latestScan && config.scanIntervalMs > 0
-      ? new Date(Date.parse(latestScan.collectedAt) + config.scanIntervalMs).toISOString()
-      : null;
-    return {
-      status: semanticPromise ? 'RUNNING'
-        : !config.codexAuditEnabled ? 'DISABLED'
-          : !config.codexExecutable ? 'UNAVAILABLE' : 'ACTIVE',
-      mode: 'stateless-codex',
-      stateless: true,
-      intervalMs: config.scanIntervalMs,
-      collectedAt: new Date().toISOString(),
-      lastScanAt: latestScan?.collectedAt || null,
-      lastCodexAt: lastCodexAudit?.createdAt || null,
-      nextRunAt,
-      pendingInterventions: pendingInterventions.length,
-      projectStates: config.projects.map((project) => {
-        const audit = latestByProject.get(project.id);
-        return {
-          projectId: project.id,
-          verdict: audit?.audit?.verdict || (audit?.status === 'idle' ? 'IDLE' : 'PENDING'),
-          driftTypes: audit?.audit?.drift_type || [],
-          status: audit?.status || 'pending',
-          semanticAuditId: audit?.id || null,
-          packetHash: audit?.packetHash || null,
-          updatedAt: audit?.createdAt || null,
-        };
-      }),
-    };
-  }
 
   async function collectControlStatus(force = false) {
     if (!force && controlStatusCache
@@ -336,234 +270,7 @@ export async function createApp(overrides = {}) {
     }
   }
 
-  function queueImmediateStopReview(stop) {
-    const reviewKey = `${stop.projectId}:${stop.pid}:${stop.episodeId || stop.tailHash}`;
-    const verifiedPrompt = stop.safeToContinue !== false;
-    const event = store.createAutomationEvent({
-      eventKey: `stop-review:${reviewKey}`,
-      category: 'professor_review',
-      eventType: 'STOP_REVIEW_QUEUED',
-      targetId: stop.projectId,
-      severity: 'info',
-      title: `Immediate liveness review: ${stop.projectId}`,
-      message: verifiedPrompt
-        ? 'The project reached a normal input point; a project-scoped Codex review was queued immediately.'
-        : 'The project stopped producing recognizable output; Codex review was queued, but continuation remains blocked until a normal prompt is verified.',
-      source: { deliveryPolicy: 'none', stop },
-    });
-    if (!['PENDING', 'HELD'].includes(event.status) || stopReviewInFlight.has(reviewKey)) {
-      return event;
-    }
-    if (event.status === 'HELD') {
-      store.setAutomationEvent(event.id, { status: 'PENDING', note: 'retrying_immediate_stop_review' });
-    }
-    const job = (async () => {
-      try {
-        const scanResult = await scan();
-        const semantic = await runImmediateSemanticCycle(scanResult, stop.projectId);
-        const result = semantic.results?.find((item) => item.projectId === stop.projectId);
-        const verdict = result?.audit?.verdict || null;
-        store.setAutomationEvent(event.id, {
-          status: 'RESOLVED',
-          note: `immediate_stop_review_${verdict || result?.status || semantic.status}`,
-        });
-        if (verifiedPrompt && result?.status === 'completed' && ['PASS', 'WARN'].includes(verdict)) {
-          await automationEngine.continueReviewedStop?.(stop, { verdict });
-        }
-      } catch (error) {
-        store.setAutomationEvent(event.id, {
-          status: 'HELD',
-          note: `immediate_stop_review_failed:${String(error.message || error).slice(0, 300)}`,
-        });
-      } finally {
-        stopReviewInFlight.delete(reviewKey);
-      }
-    })();
-    stopReviewInFlight.set(reviewKey, job);
-    return event;
-  }
-
-  async function dispatchIntervention(interventionId, requestedSessionId = null, automatic = false) {
-    const intervention = store.getIntervention(interventionId);
-    if (!intervention) throw new SessionError('intervention_not_found', 'Intervention was not found', 404);
-    if (!['PROPOSED', 'HELD'].includes(intervention.status)) {
-      throw new SessionError('intervention_not_pending', 'Intervention is not pending', 409);
-    }
-    const sourceAudit = store.getSemanticAudit(intervention.semanticAuditId)?.audit;
-    if (!reanchorEligible(sourceAudit)) {
-      store.setIntervention(intervention.id, {
-        status: 'CLEARED',
-        note: 'blocked_at_dispatch_without_programmatically_grounded_evidence',
-      });
-      throw new SessionError(
-        'intervention_evidence_not_grounded',
-        'Intervention no longer has verified authority and recent-session evidence',
-        409,
-      );
-    }
-    if (automatic) {
-      const previous = store.lastSentIntervention(intervention.projectId);
-      if (previous?.sentAt
-          && Date.now() - Date.parse(previous.sentAt) < config.reanchorCooldownMs) {
-        return store.setIntervention(intervention.id, {
-          status: 'HELD',
-          note: 'automatic_cooldown_active',
-        });
-      }
-    }
-    const sessions = await sessionManager.list();
-    const candidates = sessions.filter((session) => (
-      session.projectId === intervention.projectId && session.status === 'WAITING_INPUT'
-    ));
-    const session = requestedSessionId
-      ? candidates.find((candidate) => candidate.id === requestedSessionId)
-      : candidates.length === 1 ? candidates[0] : null;
-    if (!session) {
-      if (automatic) {
-        return store.setIntervention(intervention.id, {
-          status: 'HELD',
-          note: candidates.length > 1 ? 'multiple_waiting_sessions' : 'no_waiting_managed_session',
-        });
-      }
-      throw new SessionError(
-        'waiting_session_required',
-        'Exactly one waiting managed session, or an explicit matching sessionId, is required',
-        409,
-      );
-    }
-    const safePrompt = buildReanchorPrompt({ id: intervention.projectId }, sourceAudit);
-    await sessionManager.input(session.id, `${safePrompt}\r`);
-    return store.setIntervention(intervention.id, {
-      status: 'SENT',
-      sessionId: session.id,
-      sentAt: new Date().toISOString(),
-      note: automatic ? 'automatic_guarded_reanchor' : 'user_approved_reanchor',
-    });
-  }
-
-  async function executeSemanticCycle(scanResult, onlyProjectId = null) {
-      if (!config.codexAuditEnabled) return { status: 'disabled', results: [] };
-      if (!config.codexExecutable) return { status: 'unavailable', results: [], error: 'codex_not_found' };
-      const targets = config.projects.filter((project) => !onlyProjectId || project.id === onlyProjectId);
-      const results = [];
-      for (const project of targets) {
-        const heartbeat = await readClaudeHistoryHeartbeat(project.path, {
-          claudeProjectsDir: config.claudeProjectsDir,
-        });
-        const activeJobRunIds = (automationEngine.jobsSnapshot?.()?.items || [])
-          .filter((item) => (
-            ['pending', 'running'].includes(item.state)
-            && (item.projectId === project.id || item.runId === project.id
-              || String(item.runId || '').startsWith(`${project.id}_`))
-          ))
-          .map((item) => item.runId);
-        if (heartbeat.constructionLease?.active
-            || heartbeat.waitingForJobRunIds?.length || activeJobRunIds.length) {
-          results.push({
-            projectId: project.id,
-            status: 'deferred',
-            error: heartbeat.constructionLease?.active
-              ? 'construction_lease_active' : 'registered_job_active',
-            constructionLease: heartbeat.constructionLease,
-            waitingForJobRunIds: heartbeat.waitingForJobRunIds || [],
-            activeJobRunIds,
-          });
-          continue;
-        }
-        const previous = store.latestSemanticAudit(project.id);
-        const activity = await readRecentClaudeActivity(project.path, {
-          claudeProjectsDir: config.claudeProjectsDir,
-          lookbackMs: config.codexAuditLookbackMs,
-          maxMessages: 16,
-          maxTextChars: 12 * 1024,
-          maxMessageChars: 3 * 1024,
-        });
-        if (activity.status !== 'ok') {
-          if (previous?.status === activity.status && previous.error === activity.reason) {
-            results.push({ ...previous, cached: true });
-            continue;
-          }
-          const result = { status: activity.status, error: activity.reason, audit: null };
-          const id = store.saveSemanticAudit(scanResult.id, project.id, result);
-          results.push({ id, projectId: project.id, ...result });
-          continue;
-        }
-        const snapshotProject = scanResult.snapshot.projects.find((item) => item.id === project.id);
-        if (!snapshotProject) continue;
-        const packet = buildSemanticPacket(project, snapshotProject, activity, scanResult.audit);
-        const packetHash = semanticPacketHash(packet);
-        if (previous?.status === 'completed' && previous.packetHash === packetHash && previous.audit) {
-          let intervention = null;
-          if (config.reanchorMode !== 'off' && reanchorEligible(previous.audit)) {
-            intervention = store.createIntervention(
-              previous.id,
-              project.id,
-              buildReanchorPrompt(snapshotProject, previous.audit),
-              'restored_from_unchanged_high_confidence_audit',
-            );
-            if (config.reanchorMode === 'auto'
-                && ['PROPOSED', 'HELD'].includes(intervention?.status)) {
-              intervention = await dispatchIntervention(intervention.id, null, true);
-            }
-          } else {
-            intervention = store.clearPendingIntervention(project.id, {
-              semanticAuditId: previous.id,
-              packetHash: previous.packetHash,
-              verdict: previous.audit.verdict,
-            });
-          }
-          results.push({ ...previous, cached: true, intervention });
-          continue;
-        }
-        const result = await runCodexSemanticAudit({ config, project, packet });
-        const id = store.saveSemanticAudit(scanResult.id, project.id, result);
-        let intervention = null;
-        if (config.reanchorMode !== 'off' && reanchorEligible(result.audit)) {
-          intervention = store.createIntervention(
-            id,
-            project.id,
-            buildReanchorPrompt(snapshotProject, result.audit),
-            'generated_from_high_confidence_codex_shadow_audit',
-          );
-          if (config.reanchorMode === 'auto') {
-            intervention = await dispatchIntervention(intervention.id, null, true);
-          }
-        } else if (result.status === 'completed' && result.audit) {
-          intervention = store.clearPendingIntervention(project.id, {
-            semanticAuditId: id,
-            packetHash: result.packetHash,
-            verdict: result.audit.verdict,
-          });
-        }
-        results.push({ id, projectId: project.id, ...result, intervention });
-      }
-      return { status: 'completed', results };
-  }
-
-  function runSemanticCycle(scanResult, onlyProjectId = null) {
-    const run = semanticTail
-      .catch(() => undefined)
-      .then(() => executeSemanticCycle(scanResult, onlyProjectId));
-    semanticTail = run;
-    semanticPromise = run;
-    return run.finally(() => {
-      if (semanticPromise === run) semanticPromise = null;
-    });
-  }
-
-  function runImmediateSemanticCycle(scanResult, projectId) {
-    const run = immediateSemanticTail
-      .catch(() => undefined)
-      .then(() => executeSemanticCycle(scanResult, projectId));
-    immediateSemanticTail = run;
-    return run;
-  }
-
-  async function fullCycle() {
-    const scanResult = await scan();
-    const semantic = await runSemanticCycle(scanResult);
-    return { ...scanResult, semantic };
-  }
+  const fullCycle = scan;
 
   const server = createServer(async (req, res) => {
     try {
@@ -572,20 +279,13 @@ export async function createApp(overrides = {}) {
         const broker = await sessionManager.health?.();
         return sendJson(res, 200, {
           ok: true,
-          mode: 'shadow-read-only',
+          mode: continuitySupervisor ? 'operations-and-continuity' : 'operations-only',
           autoCorrection: false,
+          scientificAuthority: 'external-only',
           projectCount: config.projects.length,
           controlTargetCount: config.controlTargets.length,
           scanIntervalMs: config.scanIntervalMs,
           managedSessions: true,
-          codexAuditEnabled: config.codexAuditEnabled,
-          codexAvailable: Boolean(config.codexExecutable),
-          sessionResolver: {
-            enabled: config.operationalResolver?.enabled === true,
-            available: Boolean(config.codexExecutable),
-            mode: 'event-driven-codex',
-          },
-          reanchorMode: config.reanchorMode,
           automation: {
             gpuQueueEnabled: config.gpuQueue.enabled,
             gpuQueueStatus: automationEngine.snapshot().status,
@@ -593,18 +293,10 @@ export async function createApp(overrides = {}) {
             gpuSchedulerMonitor: automationEngine.monitorSnapshot?.() || {
               status: 'unknown', reason: 'monitor_probe_unavailable',
             },
-            codexProfessor: {
-              mode: config.professor?.mode || 'stateless-codex',
-              intervalMs: config.professor?.intervalMs || config.scanIntervalMs,
-              running: Boolean(semanticPromise),
-              immediateStopReviews: stopReviewInFlight.size,
-            },
             watchdogPollMs: config.watchdog.pollMs,
-            stopReviewStableMs: config.watchdog.stopReviewStableMs,
-            activeGoalLoops: config.goalLoop?.enabled === true
-              ? store.listAutomationPolicies().filter((item) => item.enabled).length : 0,
-            goalLoopEnabled: config.goalLoop?.enabled === true,
+            researchMessageAuthority: continuitySupervisor ? 'continuity-only' : false,
           },
+          continuity: continuitySupervisor?.snapshot() || { enabled: false, inflight: [] },
           broker: broker || { embeddedTestDouble: true },
           node: process.version,
         });
@@ -629,29 +321,13 @@ export async function createApp(overrides = {}) {
         const events = store.listAutomationEvents(1000);
         const outbox = store.listOutboxMessages(1000);
         const jobsSnapshot = automationEngine.jobsSnapshot?.() || jobRegistry.snapshot();
-        const policies = new Map(store.listAutomationPolicies()
-          .map((policy) => [policy.targetId, policy]));
         return sendJson(res, 200, {
           status: discovered.status,
           terminalStatus: discovered.terminalStatus,
           items: discovered.items.map((session) => {
-            const rollingSince = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
-            const budgetEpoch = config.goalLoop?.budgetEpoch;
-            const since = [rollingSince, budgetEpoch, session.terminal?.lastRateLimitResetAt]
-              .filter((value) => value && Number.isFinite(Date.parse(value)))
-              .sort((left, right) => Date.parse(right) - Date.parse(left))[0];
-            const recentGoal = session.projectId
-              ? store.recentGoalActions(session.projectId, since)
-              : { count: 0 };
-            const storedGoalPolicy = policies.get(session.projectId);
-            const effectiveGoalPolicy = config.goalLoop?.enabled === true
-              && storedGoalPolicy?.enabled === true
-              ? storedGoalPolicy : null;
             const operational = deriveOperationalState(session, {
               events,
               outbox,
-              goalPolicy: effectiveGoalPolicy,
-              goalBudgetReached: recentGoal.count >= config.goalLoop.maxContinuesPerDay,
               schedulerMonitor: automationEngine.monitorSnapshot?.(),
               jobs: jobsSnapshot,
             });
@@ -684,26 +360,8 @@ export async function createApp(overrides = {}) {
           url.searchParams.get('refresh') === '1',
         ));
       }
-      if (req.method === 'GET' && url.pathname === '/api/professor-status') {
-        return sendJson(res, 200, await collectProfessorStatus());
-      }
       if (req.method === 'GET' && url.pathname === '/api/scans') {
         return sendJson(res, 200, store.list(url.searchParams.get('limit')));
-      }
-      if (req.method === 'GET' && url.pathname === '/api/semantic-audits') {
-        return sendJson(
-          res,
-          200,
-          store.listSemanticAudits(url.searchParams.get('limit'), url.searchParams.get('projectId')),
-        );
-      }
-      if (req.method === 'GET' && url.pathname === '/api/interventions') {
-        return sendJson(
-          res,
-          200,
-          store.listInterventions(url.searchParams.get('limit'))
-            .map((item) => interventionView(store, item)),
-        );
       }
       if (req.method === 'GET' && url.pathname === '/api/jobs') {
         const limitValue = url.searchParams.get('limit');
@@ -763,12 +421,6 @@ export async function createApp(overrides = {}) {
       if (req.method === 'GET' && url.pathname === '/api/session-episodes') {
         return sendJson(res, 200, store.listSessionEpisodes(url.searchParams.get('limit')));
       }
-      if (req.method === 'GET' && url.pathname === '/api/automation-policies') {
-        const policies = store.listAutomationPolicies().map((policy) => (
-          config.goalLoop?.enabled === true ? policy : { ...policy, enabled: false, objective: '' }
-        ));
-        return sendJson(res, 200, policies);
-      }
       if (req.method === 'GET' && url.pathname === '/api/project-progress') {
         return sendJson(res, 200, store.listProjectProgress());
       }
@@ -789,73 +441,9 @@ export async function createApp(overrides = {}) {
         const result = await scan();
         return sendJson(res, 201, result);
       }
-      if (req.method === 'POST' && url.pathname === '/api/semantic-audit') {
-        const body = await readJson(req, { allowed: ['projectId'] });
-        if (body.projectId && !config.projects.some((project) => project.id === body.projectId)) {
-          throw new SessionError('project_not_found', 'Project is not configured', 404);
-        }
-        const scanResult = await scan();
-        return sendJson(res, 202, await runSemanticCycle(scanResult, body.projectId || null));
-      }
       if (req.method === 'POST' && url.pathname === '/api/automation-cycle') {
         await readJson(req, { allowed: [] });
         return sendJson(res, 200, await automationEngine.cycle({ forceQueue: true }));
-      }
-      const externalContinueMatch = url.pathname.match(/^\/api\/external-sessions\/([^/]+)\/continue$/);
-      if (req.method === 'POST' && externalContinueMatch) {
-        await readJson(req, { allowed: [] });
-        const projectId = decodeURIComponent(externalContinueMatch[1]);
-        if (!config.projects.some((project) => project.id === projectId)) {
-          throw new SessionError('project_not_found', 'Project is not configured', 404);
-        }
-        const discovered = await externalSessionsCollector();
-        const candidates = discovered.items.filter((session) => session.projectId === projectId);
-        if (candidates.length !== 1 || candidates[0].terminal?.state !== 'WAITING_INPUT') {
-          throw new SessionError(
-            'external_session_not_waiting',
-            'Exactly one external iTerm Claude session at a normal input prompt is required',
-            409,
-          );
-        }
-        const result = await automationEngine.continueExternalSession(
-          candidates[0],
-          externalContinuationPrompt(),
-        );
-        return sendJson(res, 202, { ...result, projectId });
-      }
-      const automationPolicyMatch = url.pathname.match(/^\/api\/automation-policies\/([^/]+)$/);
-      if (req.method === 'POST' && automationPolicyMatch) {
-        const targetId = decodeURIComponent(automationPolicyMatch[1]);
-        if (!config.projects.some((project) => project.id === targetId)) {
-          throw new SessionError('project_not_found', 'Project is not configured', 404);
-        }
-        const body = await readJson(req, {
-          allowed: ['enabled', 'objective'],
-          required: ['enabled', 'objective'],
-        });
-        if (typeof body.enabled !== 'boolean') {
-          throw new SessionError('invalid_goal_policy', 'enabled must be a boolean');
-        }
-        if (body.enabled && config.goalLoop?.enabled !== true) {
-          throw new SessionError(
-            'goal_loop_globally_disabled',
-            'Automatic Goal Loop injection is globally disabled; use routine-choice handling or an explicit manual continuation.',
-            409,
-          );
-        }
-        if (typeof body.objective !== 'string' || body.objective.length > 4000
-            || (body.enabled && !body.objective.trim())) {
-          throw new SessionError(
-            'invalid_goal_policy',
-            'objective must be non-empty when enabled and no larger than 4000 characters',
-          );
-        }
-        const policy = store.setAutomationPolicy(targetId, {
-          enabled: body.enabled,
-          objective: body.objective.trim(),
-        });
-        await automationEngine.cycle();
-        return sendJson(res, 200, policy);
       }
       const projectProgressMatch = url.pathname.match(/^\/api\/project-progress\/([^/]+)$/);
       if (req.method === 'POST' && projectProgressMatch) {
@@ -982,28 +570,6 @@ export async function createApp(overrides = {}) {
           await sessionManager.stop(decodeURIComponent(stopMatch[1]), body),
         );
       }
-      const interventionSendMatch = url.pathname.match(/^\/api\/interventions\/(\d+)\/send$/);
-      if (req.method === 'POST' && interventionSendMatch) {
-        const body = await readJson(req, { allowed: ['sessionId'] });
-        return sendJson(
-          res,
-          200,
-          await dispatchIntervention(interventionSendMatch[1], body.sessionId || null, false),
-        );
-      }
-      const interventionDismissMatch = url.pathname.match(/^\/api\/interventions\/(\d+)\/dismiss$/);
-      if (req.method === 'POST' && interventionDismissMatch) {
-        const body = await readJson(req, { allowed: ['note'] });
-        const item = store.getIntervention(interventionDismissMatch[1]);
-        if (!item) throw new SessionError('intervention_not_found', 'Intervention was not found', 404);
-        if (item.status !== 'PROPOSED' && item.status !== 'HELD') {
-          throw new SessionError('intervention_not_pending', 'Intervention is not pending', 409);
-        }
-        return sendJson(res, 200, store.setIntervention(item.id, {
-          status: 'DISMISSED',
-          note: typeof body.note === 'string' ? body.note.slice(0, 1000) : 'dismissed_by_user',
-        }));
-      }
       const automationSendMatch = url.pathname.match(/^\/api\/automation-events\/(\d+)\/send$/);
       if (req.method === 'POST' && automationSendMatch) {
         const body = await readJson(req, { allowed: ['sessionId'] });
@@ -1127,7 +693,6 @@ export async function createApp(overrides = {}) {
     sessionManager,
     scan,
     fullCycle,
-    runSemanticCycle,
     automationEngine,
     async listen(port = config.port, host = config.host) {
       await new Promise((resolve, reject) => {
@@ -1157,13 +722,12 @@ export async function createApp(overrides = {}) {
         clearInterval(automationTimer);
         automationTimer = null;
       }
-      if (stopReviewInFlight.size) {
-        await Promise.allSettled([...stopReviewInFlight.values()]);
-      }
       for (const client of webSockets.clients) client.terminate();
       if (server.listening) await new Promise((resolve) => server.close(resolve));
       webSockets.close();
       await sessionManager.close();
+      continuityResolver?.close?.();
+      await continuitySupervisor?.idle?.();
       store.close();
     },
   };

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { chmod, mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { DatabaseSync } from 'node:sqlite';
 import test from 'node:test';
 import { createEvidenceBundle, verifyEvidenceBundle } from '../src/evidence.js';
 import { createStore } from '../src/store.js';
@@ -38,81 +39,9 @@ test('evidence bundle hashes verify and SQLite retains history', async () => {
     assert.equal(restored.evidenceHash, evidence.bundleHash);
     assert.equal(restored.snapshot.mode, 'shadow-read-only');
     assert.equal(store.list().length, 1);
-    const semanticId = store.saveSemanticAudit(id, 'ACL_1', {
-      status: 'completed',
-      packetHash: 'f'.repeat(64),
-      packetPath: '/packet.json',
-      resultPath: '/result.json',
-      audit: { verdict: 'INTERVENE', confidence: 0.9 },
-      error: null,
-    });
-    assert.equal(store.getSemanticAudit(semanticId).audit.verdict, 'INTERVENE');
-    assert.equal(store.latestSemanticAudit('ACL_1').id, semanticId);
-    const intervention = store.createIntervention(
-      semanticId,
-      'ACL_1',
-      'fixed reanchor prompt',
-      'test',
-    );
-    assert.equal(intervention.status, 'PROPOSED');
-    const secondSemanticId = store.saveSemanticAudit(id, 'ACL_1', {
-      status: 'completed',
-      packetHash: 'e'.repeat(64),
-      packetPath: '/packet-2.json',
-      resultPath: '/result-2.json',
-      audit: { verdict: 'INTERVENE', confidence: 0.95 },
-      error: null,
-    });
-    const refreshed = store.createIntervention(
-      secondSemanticId,
-      'ACL_1',
-      'new fixed reanchor prompt',
-      'new audit',
-    );
-    assert.equal(refreshed.id, intervention.id);
-    assert.equal(refreshed.semanticAuditId, secondSemanticId);
-    assert.equal(refreshed.promptText, 'new fixed reanchor prompt');
-    assert.equal(store.listInterventions().length, 1);
-    const samePacketSemanticId = store.saveSemanticAudit(id, 'ACL_1', {
-      status: 'completed',
-      packetHash: 'e'.repeat(64),
-      packetPath: '/packet-2.json',
-      resultPath: '/result-pass-same-packet.json',
-      audit: { verdict: 'PASS', confidence: 0.9 },
-      error: null,
-    });
-    const unchanged = store.clearPendingIntervention('ACL_1', {
-      semanticAuditId: samePacketSemanticId,
-      packetHash: 'e'.repeat(64),
-      verdict: 'PASS',
-    });
-    assert.equal(unchanged.status, 'PROPOSED');
-    const changedPacketSemanticId = store.saveSemanticAudit(id, 'ACL_1', {
-      status: 'completed',
-      packetHash: 'd'.repeat(64),
-      packetPath: '/packet-3.json',
-      resultPath: '/result-pass-new-packet.json',
-      audit: { verdict: 'PASS', confidence: 0.9 },
-      error: null,
-    });
-    const cleared = store.clearPendingIntervention('ACL_1', {
-      semanticAuditId: changedPacketSemanticId,
-      packetHash: 'd'.repeat(64),
-      verdict: 'PASS',
-    });
-    assert.equal(cleared.status, 'CLEARED');
-    const replacement = store.createIntervention(
-      changedPacketSemanticId,
-      'ACL_1',
-      'reopened prompt',
-      'new drift',
-    );
-    assert.notEqual(replacement.id, intervention.id);
-    const sent = store.setIntervention(intervention.id, {
-      status: 'SENT', sessionId: 'session-1', sentAt: '2026-01-01T01:00:00.000Z', note: 'test',
-    });
-    assert.equal(sent.sessionId, 'session-1');
-    assert.equal(store.lastSentIntervention('ACL_1').id, intervention.id);
+    assert.equal(store.saveSemanticAudit, undefined);
+    assert.equal(store.createIntervention, undefined);
+    assert.equal(store.setAutomationPolicy, undefined);
   } finally {
     store?.close();
     if (evidence) await chmod(evidence.directory, 0o755);
@@ -120,39 +49,29 @@ test('evidence bundle hashes verify and SQLite retains history', async () => {
   }
 });
 
-test('opening the store resolves legacy persistent Professor events', async () => {
-  const directory = await mkdtemp(join(tmpdir(), 'firm-professor-migration-'));
+test('raw scan and GPU snapshot history stays within configured retention', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'firm-retention-'));
   let store;
   try {
-    store = await createStore(directory);
-    store.createAutomationEvent({
-      eventKey: 'legacy-professor-review',
-      category: 'professor_review',
-      eventType: 'PROFESSOR_REVIEW_AVAILABLE',
-      targetId: 'RESEARCH_PROFESSOR',
-      runId: 'ACL_1',
-      severity: 'warn',
-      title: 'Legacy review',
-      message: 'Legacy bounded packet',
-      source: {},
-    });
-    store.createAutomationEvent({
-      eventKey: 'current-stop-review',
-      category: 'professor_review',
-      eventType: 'STOP_REVIEW_QUEUED',
-      targetId: 'ACL_1',
-      severity: 'info',
-      title: 'Current stop review',
-      message: 'Must survive restart',
-      source: {},
-    });
+    store = await createStore(directory, { scanRetention: 10, gpuSnapshotRetention: 20 });
+    for (let index = 0; index < 25; index += 1) {
+      store.save(
+        { collectedAt: new Date(index * 1000).toISOString(), projects: [{ index }] },
+        { auditedAt: new Date(index * 1000).toISOString(), findings: [] },
+        { bundleHash: index.toString(16).padStart(64, '0'), directory: `/evidence/${index}` },
+      );
+    }
+    for (let index = 0; index < 45; index += 1) {
+      store.saveGpuQueueSnapshot({
+        collectedAt: new Date(index * 1000).toISOString(), status: 'ok', items: [{ index }],
+      });
+    }
     store.close();
     store = null;
-    store = await createStore(directory);
-    const event = store.getAutomationEvent('legacy-professor-review');
-    assert.equal(event.status, 'RESOLVED');
-    assert.equal(event.note, 'replaced_by_stateless_codex_professor_engine');
-    assert.equal(store.getAutomationEvent('current-stop-review').status, 'PENDING');
+    const db = new DatabaseSync(join(directory, 'history.sqlite'), { readOnly: true });
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM scans').get().count, 10);
+    assert.equal(db.prepare('SELECT COUNT(*) AS count FROM gpu_queue_snapshots').get().count, 20);
+    db.close();
   } finally {
     store?.close();
     await rm(directory, { recursive: true, force: true });

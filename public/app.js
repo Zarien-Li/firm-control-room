@@ -38,10 +38,7 @@ let terminalSocket = null;
 let reconnectTimer = null;
 let reconnectAttempt = 0;
 let lastRenderPayload = null;
-let automationPolicies = [];
-let showIdleProjects = false;
 let lastControlStatus = null;
-let lastProfessorStatus = null;
 let sessionTargetIds = new Set();
 let externalSessionStates = [];
 let dashboardRefreshPromise = null;
@@ -61,19 +58,6 @@ function liveField(text, label) {
   return line ? line.slice(line.indexOf(':') + 1).trim() : null;
 }
 
-function semanticStatus(item) {
-  if (item?.audit?.verdict) return { verdict: item.audit.verdict, text: item.audit.summary };
-  if (!item) return { verdict: 'PENDING', text: '等待首次语义巡检' };
-  if (item.status === 'idle') return { verdict: 'IDLE', text: '最近五小时无研究活动' };
-  if (item.status === 'unavailable') return { verdict: 'OFFLINE', text: '尚无可读取的 Claude 会话历史' };
-  if (item.status === 'failed') return { verdict: 'ERROR', text: 'Codex 巡检失败；研究会话未被修改' };
-  return { verdict: 'PENDING', text: '巡检尚未完成' };
-}
-
-function verdictClass(verdict) {
-  return `verdict-${String(verdict || 'UNKNOWN').toLowerCase()}`;
-}
-
 function automationNote(item) {
   const labels = {
     scheduler_is_external_and_cannot_be_injected: 'Scheduler 外部运行，等待控制台接管',
@@ -91,9 +75,6 @@ function externalSessionLabel(session) {
     MODEL_WORKING: '模型工作中',
     TOOL_RUNNING: '工具运行中',
     READY_FOR_INPUT: '等待输入 · 继续',
-    READY_FOR_CONTINUATION: 'Goal 待续跑',
-    WAITING_REVIEW: '等待独立审查',
-    POLICY_HELD: '策略暂停',
     MESSAGE_PENDING_ACK: '消息待确认',
     DRAFT_PENDING_ENTER: '续跑文本待提交',
     WAITING_FOR_JOB: '等待已注册任务',
@@ -108,7 +89,7 @@ function externalSessionLabel(session) {
   const sessionLabel = labels[state] || state;
   const jobLabel = activeProjectJobLabel(session?.projectActiveJobs || []);
   if (!jobLabel) return sessionLabel;
-  if (['READY_FOR_INPUT', 'READY_FOR_CONTINUATION'].includes(state)) return jobLabel;
+  if (state === 'READY_FOR_INPUT') return jobLabel;
   return `${sessionLabel} · ${jobLabel}`;
 }
 
@@ -146,11 +127,6 @@ function externalSessionFact(session) {
   return `PID ${session.pid} · ${externalSessionLabel(session)}`;
 }
 
-function externalCanContinue(session) {
-  return ['READY_FOR_INPUT', 'READY_FOR_CONTINUATION'].includes(session?.operationalState)
-    || (!session?.operationalState && session?.terminal?.state === 'WAITING_INPUT');
-}
-
 function heartbeatLabel(heartbeat) {
   if (!heartbeat) return '等待有效进展采集';
   if (heartbeat.status !== 'ok') return `采集降级 · ${heartbeat.historyStatus || 'unknown'}`;
@@ -170,12 +146,6 @@ async function refreshExternalSessionStatus() {
     if (fact) fact.textContent = externalSessionFact(session);
     const progress = document.querySelector(`[data-heartbeat-project="${CSS.escape(session.projectId)}"]`);
     if (progress) progress.textContent = heartbeatLabel(session.heartbeat);
-    const button = document.querySelector(`[data-continue-external="${CSS.escape(session.projectId)}"]`);
-    if (!button) continue;
-    button.textContent = externalSessionLabel(session);
-    button.disabled = !externalCanContinue(session);
-    button.classList.remove('external-working', 'external-waiting', 'external-confirmation', 'external-unknown');
-    button.classList.add(`external-${externalCanContinue(session) ? 'waiting' : 'working'}`);
   }
 }
 
@@ -216,27 +186,6 @@ function renderControlStatus(status) {
     </dl>`;
 }
 
-function renderProfessorStatus(status) {
-  if (!status || !$('#professor-band')) return;
-  lastProfessorStatus = status;
-  const intervalHours = Number.isFinite(status.intervalMs)
-    ? status.intervalMs / (60 * 60 * 1000) : null;
-  $('#professor-live-state').textContent = `${status.status || 'UNKNOWN'} · STATELESS`;
-  $('#professor-summary').textContent = [
-    status.lastCodexAt ? `最近 Codex ${formatTime(status.lastCodexAt)}` : '等待首次 Codex 巡检',
-    status.nextRunAt ? `下次 ${formatTime(status.nextRunAt)}`
-      : intervalHours ? `周期 ${intervalHours} 小时` : '',
-    `${status.pendingInterventions || 0} 个待确认重锚`,
-  ].filter(Boolean).join(' · ');
-  $('#professor-actions').innerHTML = '<button class="compact" data-run-professor>立即差分巡检</button>';
-  const states = status.projectStates || [];
-  $('#professor-projects').innerHTML = states.length ? states.slice(0, 9).map((item) => `
-    <span class="professor-project">
-      <b class="${verdictClass(item.verdict)}">${escapeHtml(item.projectId)}</b>
-      <small>${escapeHtml(item.verdict)} · ${escapeHtml(item.status)}${item.updatedAt ? ` · ${escapeHtml(formatTime(item.updatedAt))}` : ''}</small>
-    </span>`).join('') : '<span class="empty">等待首次隔离巡检</span>';
-}
-
 function bindDashboardActions() {
   document.querySelectorAll('[data-start-project]').forEach((button) => {
     button.addEventListener('click', () => startProject(button.dataset.startProject));
@@ -246,69 +195,6 @@ function bindDashboardActions() {
   });
   document.querySelectorAll('[data-open-session]').forEach((button) => {
     button.addEventListener('click', () => selectSession(button.dataset.openSession));
-  });
-  document.querySelectorAll('[data-continue-external]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      const projectId = button.dataset.continueExternal;
-      if (!confirm(`向 ${projectId} 的外部 iTerm Claude 发送固定、范围保持的续跑指令？`)) return;
-      button.disabled = true;
-      button.textContent = '正在续跑…';
-      try {
-        await request(`/api/external-sessions/${encodeURIComponent(projectId)}/continue`, jsonOptions({}));
-        $('#session-status').textContent = `${projectId} 已提交续跑指令`;
-        setTimeout(() => refreshExternalSessionStatus().catch(() => {}), 1000);
-      } catch (error) {
-        $('#session-status').textContent = `外部续跑失败：${error.message}`;
-        await refreshExternalSessionStatus();
-      }
-    });
-  });
-  document.querySelectorAll('[data-audit-project]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      button.disabled = true;
-      button.textContent = '巡检中…';
-      try {
-        await request('/api/semantic-audit', jsonOptions({ projectId: button.dataset.auditProject }));
-        await refresh();
-      } catch (error) {
-        $('#session-status').textContent = `Codex 巡检失败：${error.message}`;
-      } finally {
-        button.disabled = false;
-        button.textContent = '巡检';
-      }
-    });
-  });
-  document.querySelectorAll('[data-run-professor]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      button.disabled = true;
-      button.textContent = '差分巡检中…';
-      try {
-        await request('/api/semantic-audit', jsonOptions({}));
-        await refresh();
-      } catch (error) {
-        $('#session-status').textContent = `Codex Professor 巡检失败：${error.message}`;
-      } finally {
-        button.disabled = false;
-        button.textContent = '立即差分巡检';
-      }
-    });
-  });
-  document.querySelectorAll('[data-send-intervention]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      if (!confirm('将固定边界重锚消息发送到该项目唯一等待输入的托管 session？')) return;
-      try {
-        await request(`/api/interventions/${button.dataset.sendIntervention}/send`, jsonOptions({}));
-        await refresh();
-      } catch (error) {
-        $('#session-status').textContent = `重锚发送失败：${error.message}`;
-      }
-    });
-  });
-  document.querySelectorAll('[data-dismiss-intervention]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      await request(`/api/interventions/${button.dataset.dismissIntervention}/dismiss`, jsonOptions({}));
-      await refresh();
-    });
   });
   document.querySelectorAll('[data-send-automation]').forEach((button) => {
     button.addEventListener('click', async () => {
@@ -337,61 +223,17 @@ function bindDashboardActions() {
       else $('#session-status').textContent = `${button.dataset.openTarget} 没有可打开的托管 session`;
     });
   });
-  document.querySelectorAll('[data-goal-project]').forEach((button) => {
-    button.addEventListener('click', async () => {
-      const projectId = button.dataset.goalProject;
-      const current = automationPolicies.find((policy) => policy.targetId === projectId);
-      const enable = !current?.enabled;
-      let objective = current?.objective || [
-        `自主完成 ${projectId} 的完整研究到可投稿论文。`,
-        '保持当前 sealed arena 和 primary outcome，先建立强基线与自然经验接触，再由证据形成和迭代方法，完成公平评估、主张收口与论文写作。',
-      ].join(' ');
-      if (enable) {
-        objective = window.prompt('为该项目设置 Goal Loop 目标（系统不会自行扩大目标）：', objective)?.trim();
-        if (!objective) return;
-      }
-      button.disabled = true;
-      try {
-        await request(`/api/automation-policies/${encodeURIComponent(projectId)}`, jsonOptions({
-          enabled: enable,
-          objective,
-        }));
-        await refresh();
-        $('#session-status').textContent = `${projectId} Goal Loop 已${enable ? '开启' : '关闭'}`;
-      } catch (error) {
-        $('#session-status').textContent = `Goal Loop 更新失败：${error.message}`;
-      } finally {
-        button.disabled = false;
-      }
-    });
-  });
 }
 
 function render(
   scan,
   history,
-  semanticAudits = [],
-  interventions = [],
   gpuQueue = {},
   automationEvents = [],
-  policies = [],
-  professorStatus = {},
   projectProgress = [],
 ) {
   const { snapshot, audit } = scan;
-  const projectSemanticState = (project) => semanticStatus(
-    semanticAudits.find((item) => item.projectId === project.id),
-  );
-  const idleProjectCount = snapshot.projects.filter((project) => (
-    projectSemanticState(project).verdict === 'IDLE'
-  )).length;
-  const visibleProjects = showIdleProjects
-    ? snapshot.projects
-    : snapshot.projects.filter((project) => projectSemanticState(project).verdict !== 'IDLE');
-  $('#toggle-idle').hidden = idleProjectCount === 0;
-  $('#toggle-idle').textContent = showIdleProjects
-    ? '隐藏 IDLE'
-    : `显示 IDLE (${idleProjectCount})`;
+  const visibleProjects = snapshot.projects;
   const groupedFindings = [...audit.findings.reduce((groups, item) => {
     const key = `${item.rule}:${item.severity}:${item.message}`;
     const current = groups.get(key) || { ...item, projects: [], count: 0 };
@@ -405,16 +247,12 @@ function render(
     ['规则状态', audit.verdict],
     ['项目', snapshot.projects.length],
     ['Claude Sessions', snapshot.sessions?.total ?? 0],
-    ['待确认重锚', interventions.filter((item) => ['PROPOSED', 'HELD'].includes(item.status)).length],
     ['Automation Inbox', automationEvents.filter((item) => ['PENDING', 'HELD', 'SENT'].includes(item.status)).length],
-    ['Goal Loops', policies.filter((item) => item.enabled).length],
   ].map(([label, value]) => `<div class="metric"><strong>${value}</strong><span>${label}</span></div>`).join('');
   $('#projects').innerHTML = visibleProjects.map((project) => `
     ${(() => {
       const origin = project.identity.value?.origin || {};
       const state = projectFile(project, 'PIPELINE_STATE.md');
-      const semantic = semanticAudits.find((item) => item.projectId === project.id);
-      const goalPolicy = policies.find((item) => item.targetId === project.id);
       const managed = managedSessions.filter((session) => session.projectId === project.id);
       const live = managed.find((session) => ['RUNNING', 'WAITING_INPUT'].includes(session.status));
       const processSession = externalSessionStates.find((session) => session.projectId === project.id)
@@ -429,11 +267,10 @@ function render(
       const maturityText = maturity?.status === 'missing'
         ? '尚未记录双轨成熟度'
         : `${maturityFields.scientific_stage || 'unknown'} / ${maturityFields.claim_stage || 'unknown'} / rival ${maturityFields.rival_health || 'unknown'}`;
-      const semanticState = semanticStatus(semantic);
       return `<article class="project-card">
         <div class="project-head">
           <div><h3>${escapeHtml(project.name)}</h3><span>${escapeHtml(origin.research_arena || project.identity.arena || project.identity.canonicalObject)}</span></div>
-          <b class="${verdictClass(semanticState.verdict)}">${escapeHtml(semanticState.verdict)}</b>
+          <b>${escapeHtml(processSession?.operationalState || live?.status || 'OFFLINE')}</b>
         </div>
         <div class="primary-outcome">
           <p>${escapeHtml(progressSummary)}</p>
@@ -444,14 +281,11 @@ function render(
           <dt>有效进展</dt><dd data-heartbeat-project="${escapeHtml(project.id)}">${escapeHtml(heartbeatLabel(processSession?.heartbeat))}</dd>
           <dt>当前动作</dt><dd>${escapeHtml(nextAction)}</dd>
           <dt>研究成熟度</dt><dd>${escapeHtml(maturityText)}</dd>
-          <dt>Codex</dt><dd>${escapeHtml(semanticState.text)}</dd>
         </dl>
         <div class="project-actions">
           ${live ? `<button class="secondary compact" data-open-session="${escapeHtml(live.id)}">打开终端</button>`
-            : processSession ? `<button class="secondary compact external-${externalCanContinue(processSession) ? 'waiting' : 'working'}" data-continue-external="${escapeHtml(project.id)}" ${externalCanContinue(processSession) ? '' : 'disabled'}>${escapeHtml(externalSessionLabel(processSession))}</button>`
+            : processSession ? `<button class="secondary compact" disabled>${escapeHtml(externalSessionLabel(processSession))}</button>`
               : `<button class="compact" data-start-project="${escapeHtml(project.id)}">启动研究</button>`}
-          <button class="secondary compact" data-audit-project="${escapeHtml(project.id)}">巡检</button>
-          <button class="secondary compact goal-${goalPolicy?.enabled ? 'on' : 'off'}" data-goal-project="${escapeHtml(project.id)}">Goal ${goalPolicy?.enabled ? 'ON' : 'OFF'}</button>
         </div>
       </article>`;
     })()}`).join('');
@@ -467,7 +301,7 @@ function render(
   $('#scheduler-band').innerHTML = `
     <div class="scheduler-identity">
       <span class="scheduler-mark">GPU</span>
-      <div><strong>GPU Scheduler</strong><small>唯一 worker 生命周期管理会话 · 不参与研究 Codex 审计</small></div>
+      <div><strong>GPU Scheduler</strong><small>唯一 worker 生命周期管理会话 · 不参与研究裁决</small></div>
     </div>
     <div class="scheduler-state"><span id="scheduler-live-state">${escapeHtml(schedulerState)}</span><small>${observedScheduler && !managedScheduler ? '停止原 iTerm 会话后可从这里启动并接管' : '自动读取 GPU_SCHEDULER_START_PROMPT.md'}</small></div>
     <div class="scheduler-actions">
@@ -479,7 +313,6 @@ function render(
     </div>
     <div class="scheduler-activity" id="scheduler-activity"><span>正在读取 Scheduler 动作…</span></div>`;
   if (lastControlStatus) renderControlStatus(lastControlStatus);
-  renderProfessorStatus(professorStatus);
   const queueCounts = gpuQueue.counts || {};
   $('#gpu-queue-updated').textContent = gpuQueue.status === 'ok'
     ? `远端同步 ${formatTime(gpuQueue.collectedAt)}`
@@ -525,31 +358,6 @@ function render(
       </div>
     </article>`;
   }).join('');
-  const pendingInterventions = interventions.filter((item) => ['PROPOSED', 'HELD'].includes(item.status));
-  $('#intervention-section').hidden = !pendingInterventions.length;
-  $('#interventions').innerHTML = pendingInterventions.map((item) => {
-    const evidence = item.evidence || [];
-    const evidenceDetails = evidence.length ? `<details class="intervention-evidence">
-      <summary>查看已验证原始证据 (${evidence.length})</summary>
-      <div class="evidence-list">${evidence.map((entry) => `<section>
-        <b>${escapeHtml(entry.sourceLabel || entry.source)}</b>
-        <small>${escapeHtml(entry.sourceKind)}</small>
-        <blockquote>${escapeHtml(entry.quote)}</blockquote>
-        ${entry.reason ? `<p>${escapeHtml(entry.reason)}</p>` : ''}
-      </section>`).join('')}</div>
-    </details>` : '<small class="evidence-empty">没有可显示的已验证原始证据</small>';
-    return `<article class="intervention">
-      <div><strong>${escapeHtml(item.projectId)}</strong><small>${escapeHtml(item.status)} · ${new Date(item.createdAt).toLocaleString()}</small></div>
-      <div class="intervention-copy">
-        <p>${escapeHtml(item.promptText.slice(0, 360))}${item.promptText.length > 360 ? '…' : ''}</p>
-        ${evidenceDetails}
-      </div>
-      <div class="intervention-actions">
-        <button class="compact" data-send-intervention="${item.id}">发送重锚</button>
-        <button class="secondary compact" data-dismiss-intervention="${item.id}">忽略</button>
-      </div>
-    </article>`;
-  }).join('');
   const sessions = snapshot.sessions?.items || [];
   $('#observed-sessions').innerHTML = sessions.length ? sessions.map((session) => `
     <article class="session-row">
@@ -580,32 +388,19 @@ function render(
 async function refresh(scanResult) {
   const [
     history,
-    semanticAudits,
-    interventions,
     gpuQueue,
     automationEvents,
-    policies,
-    professorStatus,
     projectProgress,
   ] = await Promise.all([
     request('/api/scans'),
-    request('/api/semantic-audits?limit=100'),
-    request('/api/interventions?limit=100'),
     request('/api/jobs'),
     request('/api/automation-events?limit=200'),
-    request('/api/automation-policies'),
-    request('/api/professor-status'),
     request('/api/project-progress'),
   ]);
   if (!history.length && !scanResult) return;
   const scan = scanResult || await request(`/api/scans/${history[0].id}`);
-  const latestSemantic = semanticAudits.filter((item, index, all) => (
-    all.findIndex((candidate) => candidate.projectId === item.projectId) === index
-  ));
-  automationPolicies = policies;
   lastRenderPayload = [
-    scan, history, latestSemantic, interventions, gpuQueue, automationEvents, policies,
-    professorStatus, projectProgress,
+    scan, history, gpuQueue, automationEvents, projectProgress,
   ];
   render(...lastRenderPayload);
 }
@@ -638,11 +433,6 @@ $('#scan').addEventListener('click', async (event) => {
   }
 });
 
-$('#toggle-idle').addEventListener('click', () => {
-  showIdleProjects = !showIdleProjects;
-  if (lastRenderPayload) render(...lastRenderPayload);
-});
-
 $('#automation-cycle').addEventListener('click', async (event) => {
   event.currentTarget.disabled = true;
   event.currentTarget.textContent = '同步中…';
@@ -654,20 +444,6 @@ $('#automation-cycle').addEventListener('click', async (event) => {
   } finally {
     event.currentTarget.disabled = false;
     event.currentTarget.textContent = '同步 GPU 队列';
-  }
-});
-
-$('#semantic-scan').addEventListener('click', async (event) => {
-  event.currentTarget.disabled = true;
-  event.currentTarget.textContent = 'Codex 巡检中…';
-  try {
-    await request('/api/semantic-audit', jsonOptions({}));
-    await refresh();
-  } catch (error) {
-    $('#session-status').textContent = `Codex 巡检失败：${error.message}`;
-  } finally {
-    event.currentTarget.disabled = false;
-    event.currentTarget.textContent = 'Codex 巡检';
   }
 });
 
