@@ -49,16 +49,12 @@ checks.push({
   fix: 'FIRM external iTerm control is currently supported on macOS.',
 });
 
-for (const command of ['claude', 'codex']) {
+for (const command of ['claude']) {
   const path = await executable(command);
   checks.push({
-    ok: Boolean(path) || (command === 'codex' && /^(?:0|false|off)$/i.test(
-      String(process.env.FIRM_CODEX_AUDIT_ENABLED || ''),
-    )),
+    ok: Boolean(path),
     label: path ? `${command}: ${path}` : `${command}: not found`,
-    fix: command === 'claude'
-      ? 'Install and log in to Claude Code.'
-      : 'Install/log in to Codex, or set FIRM_CODEX_AUDIT_ENABLED=false.',
+    fix: 'Install and log in to Claude Code.',
   });
 }
 

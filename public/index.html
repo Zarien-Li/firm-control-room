@@ -13,12 +13,11 @@
       <span class="brand-mark">F</span>
       <div>
         <h1>FIRM Control Room</h1>
-        <p id="session-status">固定策略自动化 · 科学决策仍属于 PI</p>
+        <p id="session-status">结构化作业事实 · 不干预研究决策</p>
       </div>
     </div>
     <div class="top-actions">
       <button id="automation-cycle" class="secondary compact">同步 GPU 队列</button>
-      <button id="semantic-scan" class="secondary compact">Codex 巡检</button>
       <button id="scan" class="secondary compact">刷新状态</button>
     </div>
   </header>
@@ -33,19 +32,6 @@
       </div>
       <div class="summary" id="summary" aria-live="polite"></div>
       <div class="project-board" id="projects"></div>
-    </section>
-    <section class="professor-band" id="professor-band" aria-live="polite">
-      <div class="professor-identity">
-        <span class="professor-mark">CX</span>
-        <div><strong>Codex Professor Engine</strong><small>无持久 session · 权威优先 · 只在证据变化时调用</small></div>
-      </div>
-      <div class="professor-state"><span id="professor-live-state">正在读取状态…</span><small id="professor-summary">每次从隔离证据重新判断</small></div>
-      <div class="professor-actions" id="professor-actions"></div>
-      <div class="professor-projects" id="professor-projects"></div>
-    </section>
-    <section class="intervention-band" id="intervention-section" hidden>
-      <div class="section-title"><h2>待确认重锚</h2><span>Codex 只识别边界，消息由固定模板生成</span></div>
-      <div class="interventions" id="interventions"></div>
     </section>
     <section class="scheduler-band" id="scheduler-band" aria-live="polite"></section>
     <section class="automation-board">
@@ -66,7 +52,7 @@
       <div class="workspace-bar">
         <div>
           <strong>Claude Sessions</strong>
-          <span>只运行研究项目与 GPU Scheduler；Codex Professor 不保留会话</span>
+          <span>研究会话自行决策；Control Room 只管理进程与任务事实</span>
         </div>
         <div class="launcher">
           <label><span class="sr-only">项目</span><select id="project-select"></select></label>

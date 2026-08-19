@@ -15,13 +15,14 @@ export const SESSION_STATES = Object.freeze([
   'CREATING',
   'RUNNING',
   'RATE_LIMITED',
+  'PROVIDER_TRANSIENT',
   'WAITING_INPUT',
   'STOPPING',
   'EXITED',
   'FAILED',
   'LOST',
 ]);
-const ACTIVE_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'WAITING_INPUT']);
+const ACTIVE_STATES = new Set(['RUNNING', 'RATE_LIMITED', 'PROVIDER_TRANSIENT', 'WAITING_INPUT']);
 const CLAUDE_READY_PATTERN = /(?:^|[\r\n])\s*❯(?!\s*\d+\.)[^\r\n]*/;
 const CONFIRMATION_PATTERN = /do you want to proceed|would you like to|press enter to continue|enter to confirm|allow this action|quick safety check/i;
 const WAITING_PATTERN = new RegExp(
@@ -367,6 +368,10 @@ export class SessionManager {
         });
       }, delay);
       session.rateLimitTimer.unref?.();
+    } else if (terminalState.state === 'PROVIDER_TRANSIENT') {
+      session.status = 'PROVIDER_TRANSIENT';
+      session.rateLimitResetAt = null;
+      session.waitReason = 'provider_transient';
     } else {
       session.rateLimitResetAt = terminalState.lastRateLimitResetAt || null;
       session.stateTimer = setTimeout(() => {
@@ -518,7 +523,7 @@ export class SessionManager {
           waitingSince: saved.waitingSince || null,
           waitReason: saved.waitReason || null,
         };
-        if (['CREATING', 'RUNNING', 'RATE_LIMITED', 'WAITING_INPUT', 'STOPPING'].includes(session.status)) {
+        if (['CREATING', 'RUNNING', 'RATE_LIMITED', 'PROVIDER_TRANSIENT', 'WAITING_INPUT', 'STOPPING'].includes(session.status)) {
           session.status = 'LOST';
           session.exitedAt = this.now().toISOString();
           this.#record(session, {

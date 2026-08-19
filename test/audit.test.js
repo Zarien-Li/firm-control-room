@@ -20,7 +20,7 @@ function baseline() {
     },
     {
       name: 'CLAUDE.md', status: 'ok', bytes: 20, sha256: 'c'.repeat(64),
-      content: '# ACL project policy',
+      content: '# ACL project policy\n<!-- FIRM_RESEARCH_AUTHORITY_BEGIN v2 -->\nFIRM is operations only.',
     },
     {
       name: 'prompt.txt', status: 'ok', bytes: 20, sha256: 'd'.repeat(64),
@@ -177,4 +177,13 @@ test('session audit reports unmapped, duplicate mapping, and location drift inde
   assert.ok(rules.includes('CLAUDE_SESSION_UNMAPPED'));
   assert.ok(rules.includes('CLAUDE_SESSION_DUPLICATE_MAPPING'));
   assert.ok(rules.includes('CLAUDE_SESSION_LOCATION_DRIFT'));
+});
+
+test('legacy FIRM scientific authority is continuously detected', () => {
+  const snapshot = baseline();
+  snapshot.projects[0].files.find((file) => file.name === 'CLAUDE.md').content =
+    'You, project Claude, Codex reviewers, and FIRM act as one autonomous PI team.';
+  const audit = auditSnapshot(snapshot);
+  assert.ok(audit.findings.some((finding) => finding.rule === 'FIRM_AUTHORITY_BOUNDARY_INVALID'));
+  assert.equal(audit.verdict, 'WARN');
 });

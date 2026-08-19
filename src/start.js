@@ -5,8 +5,8 @@ import { loadConfig } from './config.js';
 import { BrokerClient } from './broker-client.js';
 import { createApp } from './server.js';
 
-async function waitForBroker(client) {
-  for (let attempt = 0; attempt < 50; attempt += 1) {
+async function waitForBroker(client, attempts = 200) {
+  for (let attempt = 0; attempt < attempts; attempt += 1) {
     try {
       await client.health();
       return;
@@ -23,16 +23,23 @@ async function main() {
   try {
     await client.health();
   } catch {
-    await mkdir(config.dataDir, { recursive: true });
-    const log = await open(join(config.dataDir, 'broker.log'), 'a', 0o600);
-    const child = spawn(process.execPath, [join(config.root, 'src/broker.js')], {
-      detached: true,
-      stdio: ['ignore', log.fd, log.fd],
-      env: process.env,
-    });
-    child.unref();
-    await waitForBroker(client);
-    await log.close();
+    if (!config.brokerAutoStart) {
+      // Production uses a separate launchd-owned broker. Waiting here avoids a
+      // startup race without creating a second, competing broker process.
+      await waitForBroker(client);
+    } else {
+      // Development keeps the convenient self-contained startup path.
+      await mkdir(config.dataDir, { recursive: true });
+      const log = await open(join(config.dataDir, 'broker.log'), 'a', 0o600);
+      const child = spawn(process.execPath, [join(config.root, 'src/broker.js')], {
+        detached: true,
+        stdio: ['ignore', log.fd, log.fd],
+        env: process.env,
+      });
+      child.unref();
+      await waitForBroker(client);
+      await log.close();
+    }
   }
   const app = await createApp({ brokerClient: client });
   const address = await app.listen();
@@ -64,6 +71,17 @@ async function main() {
     }
   }, 15_000);
   brokerWatch.unref();
+  let shuttingDown = false;
+  const shutdown = async (signal) => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(brokerWatch);
+    console.log(`FIRM received ${signal}; closing the Web control plane cleanly.`);
+    await app.close().catch((error) => console.error('FIRM shutdown failed:', error));
+    process.exit(0);
+  };
+  process.once('SIGTERM', () => shutdown('SIGTERM'));
+  process.once('SIGINT', () => shutdown('SIGINT'));
 }
 
 main().catch((error) => {

@@ -36,7 +36,6 @@ test('delayed ACK and noisy terminal transitions never duplicate an external com
           waitingMs: 60_000, stopReviewStableMs: 10_000,
           unknownStallMs: 1_000_000, progressStallMs: 1_000_000,
         },
-        goalLoop: { graceMs: 10_000, cooldownMs: 60_000, maxContinuesPerDay: 6 },
       },
       store,
       sessionManager: { list: async () => [] },

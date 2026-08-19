@@ -29,6 +29,7 @@ Usage: submit-gpu-request.sh \
   --project-dir /home/lzy/AAAI_2026/ACL_2/composable_peft \
   --remote-command-file /home/lzy/AAAI_2026/ACL_2/composable_peft/gpu_jobs/matched_eval.sh \
   --estimated-time 2h --max-time 4h \
+  --expected-vram-mib 24000 \
   --expected-utilization 70-100% \
   --progress-marker 'step=<n>/<total>'
 
@@ -50,6 +51,7 @@ FIRST_GPU_ACTION="model_load"
 EXPECTED_UTILIZATION=""
 PROGRESS_MARKER=""
 PREPARATION_EXCEPTION="none"
+EXPECTED_VRAM_MIB=""
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +65,7 @@ while [[ $# -gt 0 ]]; do
     --max-time) MAX_TIME="${2:-}"; shift 2 ;;
     --first-gpu-action) FIRST_GPU_ACTION="${2:-}"; shift 2 ;;
     --expected-utilization) EXPECTED_UTILIZATION="${2:-}"; shift 2 ;;
+    --expected-vram-mib) EXPECTED_VRAM_MIB="${2:-}"; shift 2 ;;
     --progress-marker) PROGRESS_MARKER="${2:-}"; shift 2 ;;
     --preparation-exception) PREPARATION_EXCEPTION="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
@@ -89,10 +92,13 @@ fi
 }
 [[ "$PRIORITY" =~ ^(low|normal|high)$ ]] || { echo "Invalid priority" >&2; exit 2; }
 [[ "$GPU_COUNT" =~ ^[1-9][0-9]*$ ]] || { echo "Invalid gpu-count" >&2; exit 2; }
+[[ "$EXPECTED_VRAM_MIB" =~ ^[1-9][0-9]*$ ]] || {
+  echo "--expected-vram-mib must be a positive integer (per allocated GPU)" >&2; exit 2;
+}
 [[ "$FIRST_GPU_ACTION" =~ ^(model_load|compute|resume_compute|gpu_required_compile)$ ]] || {
   echo "Invalid first-gpu-action" >&2; exit 2;
 }
-for value in "$PROJECT_DIR" "$COMMAND_FILE" "$ESTIMATED_TIME" "$MAX_TIME" "$EXPECTED_UTILIZATION" "$PROGRESS_MARKER" "$PREPARATION_EXCEPTION"; do
+for value in "$PROJECT_DIR" "$COMMAND_FILE" "$ESTIMATED_TIME" "$MAX_TIME" "$EXPECTED_UTILIZATION" "$PROGRESS_MARKER" "$PREPARATION_EXCEPTION" "$EXPECTED_VRAM_MIB"; do
   [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || {
     echo "Metadata values must be single-line" >&2; exit 2;
   }
@@ -112,7 +118,7 @@ ssh -p "$PORT" -o BatchMode=yes -o ConnectTimeout=10 "$HOST" \
   "docker exec -i '$CONTAINER' bash -s -- \
     '$QUEUE_ROOT' '$RUN_ID' '$PROJECT' '$PURPOSE' '$PROJECT_DIR' '$COMMAND_FILE' \
     '$PRIORITY' '$GPU_COUNT' '$ESTIMATED_TIME' '$MAX_TIME' '$FIRST_GPU_ACTION' \
-    '$EXPECTED_UTILIZATION' '$PROGRESS_MARKER' '$PREPARATION_EXCEPTION' '$CREATED_AT' '$GPU_TYPE'" <<'REMOTE'
+    '$EXPECTED_UTILIZATION' '$PROGRESS_MARKER' '$PREPARATION_EXCEPTION' '$CREATED_AT' '$GPU_TYPE' '$EXPECTED_VRAM_MIB'" <<'REMOTE'
 set -euo pipefail
 QUEUE_ROOT=$1
 RUN_ID=$2
@@ -130,6 +136,7 @@ PROGRESS_MARKER=${13}
 PREPARATION_EXCEPTION=${14}
 CREATED_AT=${15}
 GPU_TYPE=${16}
+EXPECTED_VRAM_MIB=${17}
 
 [[ -d "$PROJECT_DIR" ]] || { echo "Project directory missing: $PROJECT_DIR" >&2; exit 3; }
 [[ -f "$COMMAND_FILE" ]] || { echo "Command file missing: $COMMAND_FILE" >&2; exit 3; }
@@ -170,6 +177,7 @@ cpu_smoke_passed: true
 telemetry_ready: true
 first_gpu_action: $FIRST_GPU_ACTION
 expected_compute_utilization: $EXPECTED_UTILIZATION
+expected_vram_mib: $EXPECTED_VRAM_MIB
 expected_progress_marker: $PROGRESS_MARKER
 preparation_exception: $PREPARATION_EXCEPTION
 EOF

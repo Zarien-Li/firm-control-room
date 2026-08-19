@@ -1,16 +1,8 @@
 import { activeJobs, jobWaitStatus } from './job-wait.js';
 
-const REVIEW_EVENT_TYPES = new Set([
-  'STOP_REVIEW_QUEUED',
-  'SESSION_OUTPUT_STALLED',
-  'SESSION_PROGRESS_STALLED',
-]);
-
 export function deriveOperationalState(session, {
   events = [],
   outbox = [],
-  goalPolicy = null,
-  goalBudgetReached = false,
   schedulerMonitor = null,
   jobs = null,
 } = {}) {
@@ -47,6 +39,12 @@ export function deriveOperationalState(session, {
         : 'Provider usage limit is active; waiting for its reset time.',
     );
   }
+  if (terminalState === 'PROVIDER_TRANSIENT') {
+    return state(
+      'PROVIDER_TRANSIENT',
+      'Provider is temporarily unavailable. FIRM records this fact and does not inject text or retry the research turn.',
+    );
+  }
   if (terminalState === 'DRAFT_PENDING_ENTER') {
     return state('DRAFT_PENDING_ENTER', session.terminal?.draftDeliveryMarker
       ? `Tracked delivery ${session.terminal.draftDeliveryMarker} is pasted but not submitted.`
@@ -81,11 +79,8 @@ export function deriveOperationalState(session, {
   if (activeEvents.some((event) => event.eventType === 'SESSION_PROGRESS_STALLED')) {
     return state('PROGRESS_STALLED', 'No effective progress heartbeat has advanced.');
   }
-  if (activeEvents.some((event) => REVIEW_EVENT_TYPES.has(event.eventType))) {
-    return state('WAITING_REVIEW', 'A stop or liveness episode is awaiting independent review.');
-  }
-  if (goalPolicy?.enabled && goalBudgetReached && terminalState === 'WAITING_INPUT') {
-    return state('POLICY_HELD', 'Automatic continuation is held by the configured token budget.');
+  if (activeEvents.some((event) => event.eventType === 'SESSION_OUTPUT_STALLED')) {
+    return state('OUTPUT_STALLED', 'The bounded terminal tail has not changed and its state is uncertain.');
   }
   if (session.controlId === 'GPU_SCHEDULER' && terminalState === 'WAITING_INPUT'
       && schedulerMonitor?.status === 'healthy'
@@ -104,9 +99,7 @@ export function deriveOperationalState(session, {
         ...jobWait.foreignDeclaredRunIds,
       ],
     };
-    return goalPolicy?.enabled
-      ? state('READY_FOR_CONTINUATION', 'Claude is at a verified input prompt under an active goal policy.', details)
-      : state('READY_FOR_INPUT', 'Claude is at a verified input prompt.', details);
+    return state('READY_FOR_INPUT', 'Claude is at a verified input prompt.', details);
   }
   if (terminalState === 'WORKING' && Number(heartbeat?.activeToolProcessCount || 0) > 0) {
     return state('TOOL_RUNNING', 'Claude has an active descendant tool process.');
@@ -129,5 +122,3 @@ function compactJob(job) {
 function state(name, reason, details = null) {
   return { state: name, reason, details };
 }
-
-export const sessionStateInternals = Object.freeze({ REVIEW_EVENT_TYPES });

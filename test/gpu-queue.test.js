@@ -57,6 +57,22 @@ test('normalizeGpuQueueSnapshot counts authoritative states and bounds fields', 
   });
 });
 
+test('GPU queue exposes a scheduler terminal manifest without inferring completion from a PID', () => {
+  const result = normalizeGpuQueueSnapshot({
+    collectedAt: '2026-08-18T00:00:00Z', root: '/queue', items: [{
+      runId: 'ACL_10_life', state: 'done', remotePath: '/queue/done/ACL_10_life',
+      terminalDetail: {
+        protocol_version: 1, runner: 'FIRM_GPU_QUEUE_RUNNER', state: 'done', exit_code: 0,
+        finished_at: '2026-08-18T00:00:00Z', container_pid: 314, pid_start_ticks: '1234',
+        command_fingerprint: 'a'.repeat(64),
+      },
+    }],
+  });
+  assert.equal(result.items[0].terminal.state, 'done');
+  assert.equal(result.items[0].terminal.exitCode, 0);
+  assert.equal(result.items[0].terminalIntegrity, 'MATCH');
+});
+
 test('GPU efficiency classification is phase-aware and never treats setup as a stall', () => {
   const result = normalizeGpuQueueSnapshot({
     collectedAt: '2026-08-11T00:10:00Z',
@@ -163,6 +179,22 @@ test('collectGpuQueue uses fixed SSH options and parses JSON output', async () =
   assert.doesNotMatch(invocation.args[7], /mlx worker|\bkill\b|\brm\b/);
 });
 
+test('collectGpuQueue can ensure the remote lifecycle runner before collecting', async () => {
+  const invocations = [];
+  const execFile = async (executable, args) => {
+    invocations.push({ executable, args });
+    if (invocations.length === 1) return { stdout: '' };
+    return { stdout: JSON.stringify({ collectedAt: '2026-08-18T00:00:00Z', root: '/queue', items: [] }) };
+  };
+  await collectGpuQueue({
+    enabled: true, runnerEnsureEnabled: true, sshExecutable: '/usr/bin/ssh',
+    host: 'scheduler.example', port: 22222, root: '/queue', dockerContainer: 'research', timeoutMs: 5000,
+  }, { execFile });
+  assert.equal(invocations.length, 2);
+  assert.match(invocations[0].args[7], /firm_gpu_queue_runner\.sh' --ensure/);
+  assert.match(invocations[1].args[7], /^docker exec 'research' python3 -c /);
+});
+
 test('remote collector command quotes queue roots', () => {
   const command = gpuQueueInternals.remoteCommand("/queue/space's");
   assert.match(command, /python3 -c/);
@@ -174,4 +206,9 @@ test('remote collector can read a queue inside a fixed Docker container', () => 
   assert.match(command, /^docker exec 'research-container' python3 -c /);
   assert.match(command, /'\/inside\/queue'/);
   assert.doesNotMatch(command, /\b(?:kill|rm)\b/);
+});
+
+test('remote runner ensure command is fixed to the configured queue root', () => {
+  const command = gpuQueueInternals.remoteRunnerEnsureCommand('/inside/queue', 'research-container');
+  assert.equal(command, "docker exec 'research-container' '/inside/queue/firm_gpu_queue_runner.sh' --ensure");
 });

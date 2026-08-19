@@ -4,6 +4,8 @@ const GPU_PATTERNS = [
   /--(?:gpu|gpu-id|gpu_id|device)\s*[= ]\s*(?:cuda:)?(\d+)/gi,
 ];
 const OPERATION_PATTERN = /\b(?:tmux\s+kill-(?:session|server)|killall|pkill\s+-9|rm\s+-rf)\b/i;
+const FIRM_BOUNDARY_MARKER = '<!-- FIRM_RESEARCH_AUTHORITY_BEGIN v2 -->';
+const LEGACY_FIRM_AUTHORITY = /FIRM act as one autonomous PI team/i;
 
 function finding(rule, severity, driftType, projectId, message, evidence, requirement) {
   return {
@@ -116,6 +118,15 @@ export function auditSnapshot(snapshot, now = new Date()) {
           `${file.name} 缺少可验证哈希`, { source: file.name, sha256: file.sha256 },
           `重新采集 ${file.name} 的内容、字节数和 SHA-256`);
       }
+    }
+
+    const claudePolicy = files.find((file) => file.name === 'CLAUDE.md' && file.status === 'ok');
+    if (claudePolicy && (!String(claudePolicy.content).includes(FIRM_BOUNDARY_MARKER)
+        || LEGACY_FIRM_AUTHORITY.test(String(claudePolicy.content)))) {
+      add(findings, 'FIRM_AUTHORITY_BOUNDARY_INVALID', 'high', 'operation', project.id,
+        'CLAUDE.md does not enforce the operations-only FIRM authority boundary',
+        { source: 'CLAUDE.md', sha256: claudePolicy.sha256 },
+        'Restore the canonical v2 authority block; FIRM must not be a PI, reviewer, or scientific instruction source');
     }
 
     if (identity.status === 'degraded') {

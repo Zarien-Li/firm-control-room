@@ -60,6 +60,18 @@ test('GPU queue accepts a terminal state when a short run finishes between polls
   store.close();
 });
 
+test('GPU queue preserves the terminal manifest as execution evidence', async () => {
+  const { store, registry } = await fixture();
+  registry.syncGpuQueue({ status: 'ok', items: [{
+    runId: 'ACL_10_manifest', project: 'ACL_10', state: 'done', remotePath: '/queue/done/x',
+    terminal: { state: 'done', exitCode: 0, runner: 'FIRM_GPU_QUEUE_RUNNER' },
+  }] });
+  assert.deepEqual(registry.get('ACL_10_manifest').result.terminal, {
+    state: 'done', exitCode: 0, runner: 'FIRM_GPU_QUEUE_RUNNER',
+  });
+  store.close();
+});
+
 test('GPU queue requires two authoritative misses before failing a vanished active run', async () => {
   const { store, registry } = await fixture();
   registry.syncGpuQueue({ status: 'ok', items: [{

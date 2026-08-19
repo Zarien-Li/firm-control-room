@@ -14,13 +14,11 @@ if [[ -z "$NODE" ]]; then
   NODE="$(command -v node || true)"
 fi
 if [[ -z "$NODE" || ! -x "$NODE" ]]; then
-  printf '%s FIRM could not locate Node.js 26+\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-    >> "$STATE/supervisor.log"
+  printf '%s FIRM broker could not locate Node.js 26+\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    >> "$STATE/broker-service.log"
   exit 1
 fi
 
 mkdir -p "$STATE"
-cd "$RUNTIME" || exit 1
-# launchd is the sole supervisor. exec preserves signals and lets launchd
-# apply one restart policy instead of nesting a second restart loop.
-exec "$NODE" --env-file="$RUNTIME/.env.local" "$RUNTIME/src/start.js"
+cd "$RUNTIME"
+exec "$NODE" --env-file="$RUNTIME/.env.local" "$RUNTIME/src/broker.js"

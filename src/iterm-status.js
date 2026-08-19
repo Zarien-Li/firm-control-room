@@ -113,6 +113,36 @@ const ITERM_ESCAPE_LINES = Object.freeze([
   'end run',
 ]);
 
+const ITERM_CHOICE_LINES = Object.freeze([
+  'on run argv',
+  'set targetTty to item 1 of argv',
+  'set currentChoice to (item 2 of argv) as integer',
+  'set targetChoice to (item 3 of argv) as integer',
+  'tell application "iTerm2"',
+  'repeat with w in windows',
+  'repeat with t in tabs of w',
+  'repeat with s in sessions of t',
+  'if (tty of s) is targetTty then',
+  'if targetChoice > currentChoice then',
+  'repeat (targetChoice - currentChoice) times',
+  'tell s to write text ((ASCII character 27) & "[B") newline no',
+  'end repeat',
+  'else if targetChoice < currentChoice then',
+  'repeat (currentChoice - targetChoice) times',
+  'tell s to write text ((ASCII character 27) & "[A") newline no',
+  'end repeat',
+  'end if',
+  'tell s to write text (ASCII character 13) newline no',
+  'return "ok"',
+  'end if',
+  'end repeat',
+  'end repeat',
+  'end repeat',
+  'end tell',
+  'error "iTerm session not found"',
+  'end run',
+]);
+
 function appleScriptArgs(lines, argv) {
   return [...lines.flatMap((line) => ['-e', line]), '--', ...argv];
 }
@@ -145,6 +175,35 @@ function latestRateLimit(recent) {
   return latest;
 }
 
+// A provider-side 5xx/529 is neither a research input point nor an actionable
+// terminal failure. Claude normally owns retrying it; classifying it explicitly
+// prevents the operational resolver from treating the visible prompt as a new
+// scientific decision on every polling cycle.
+function latestProviderTransient(recent) {
+  const pattern = /(?:API Error:[^\n]*(?:\b5\d\d\b|temporar(?:ily|y)|overload(?:ed)?|service unavailable|gateway)|Request (?:failed|rejected)[^\n]*\b5\d\d\b|(?:provider|service|gateway|服务|网关)[^\n]{0,160}(?:temporar(?:ily|y)|overload(?:ed)?|unavailable|retry|暂时|重试))/gi;
+  let latest = null;
+  for (const match of recent.matchAll(pattern)) {
+    const context = recent.slice(match.index, (match.index || 0) + 360);
+    const retry = context.match(/(?:retry(?:ing)?\s+in\s*|将在\s*)(\d+)\s*(seconds?|secs?|s|minutes?|mins?|m|秒|分钟)/i);
+    const amount = Number(retry?.[1] || 0);
+    const unit = String(retry?.[2] || '').toLowerCase();
+    const retryAfterSeconds = Number.isFinite(amount) && amount > 0
+      ? amount * (/^(?:minutes?|mins?|m|分钟)$/i.test(unit) ? 60 : 1)
+      : null;
+    // Fingerprint only the provider's error line, never the surrounding
+    // terminal tail: FIRM deliveries append text after the error and must not
+    // turn one unchanged outage into a new retry episode.
+    latest = {
+      index: match.index,
+      retryAfterSeconds,
+      fingerprint: createHash('sha256')
+        .update(String(match[0]).replace(/\s+/g, ' ').trim())
+        .digest('hex'),
+    };
+  }
+  return latest;
+}
+
 export function classifyItermTail(value, options = {}) {
   const tail = String(value || '').replace(/\r/g, '');
   if (!tail) return { state: 'UNKNOWN', reason: 'empty_terminal_tail' };
@@ -159,6 +218,7 @@ export function classifyItermTail(value, options = {}) {
   const staleMonitorIndex = lastIndex(/monitor still running/gi);
   const progressIndex = Math.max(activeProgressIndex, staleMonitorIndex);
   const rateLimit = latestRateLimit(recent);
+  const providerTransient = latestProviderTransient(recent);
   const statusMatches = [...recent.matchAll(/(?:^|\n)\s*⏵⏵[^\n]*/gu)];
   const latestStatus = statusMatches.at(-1) || null;
   const statusIndex = latestStatus?.index ?? -1;
@@ -216,6 +276,26 @@ export function classifyItermTail(value, options = {}) {
     return { state: 'CONFIRMATION', reason: 'interactive_confirmation_visible' };
   }
   const now = options.now instanceof Date ? options.now : new Date(options.now || Date.now());
+  // The newest provider condition owns the prompt. A prior 529 must not mask
+  // a later 429 with an explicit reset time, or FIRM will retry before quota
+  // recovery and create a delivery storm.
+  if (rateLimit && rateLimit.index > progressIndex
+      && Date.parse(rateLimit.resetAt) > now.getTime()
+      && (!providerTransient || rateLimit.index >= providerTransient.index)) {
+    return {
+      state: 'RATE_LIMITED',
+      reason: 'api_rate_limit_wait',
+      resetAt: rateLimit.resetAt,
+    };
+  }
+  if (providerTransient && providerTransient.index > progressIndex) {
+    return {
+      state: 'PROVIDER_TRANSIENT',
+      reason: 'provider_temporary_failure',
+      ...(providerTransient.retryAfterSeconds ? { retryAfterSeconds: providerTransient.retryAfterSeconds } : {}),
+      providerFailureFingerprint: providerTransient.fingerprint,
+    };
+  }
   if (rateLimit && rateLimit.index > progressIndex
       && Date.parse(rateLimit.resetAt) > now.getTime()) {
     return {
@@ -366,10 +446,25 @@ export async function dismissItermChoice(tty, options = {}) {
   return { ok: true, tty };
 }
 
+export async function selectItermChoice(tty, currentChoice, targetChoice, options = {}) {
+  if (process.platform !== 'darwin' && !options.runWrite) {
+    throw new Error('External iTerm choice control requires macOS');
+  }
+  if (!/^\/dev\/tty\S+$/.test(String(tty || ''))) throw new Error('Invalid iTerm TTY');
+  if (!Number.isSafeInteger(currentChoice) || currentChoice < 1
+      || !Number.isSafeInteger(targetChoice) || targetChoice < 1) {
+    throw new Error('Choice numbers must be positive integers');
+  }
+  const write = options.runWrite || ((lines, argv) => runAppleScript(lines, argv));
+  await write(ITERM_CHOICE_LINES, [tty, String(currentChoice), String(targetChoice)]);
+  return { ok: true, tty, currentChoice, targetChoice };
+}
+
 export const itermStatusInternals = Object.freeze({
   ITERM_WRITE_LINES,
   ITERM_ENTER_LINES,
   ITERM_CLEAR_LINES,
   ITERM_ESCAPE_LINES,
+  ITERM_CHOICE_LINES,
   appleScriptArgs,
 });

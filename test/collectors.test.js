@@ -20,12 +20,11 @@ test('public default config falls back to the portable example project', async (
   assert.equal(config.sessionTargets.length, 1);
   assert.deepEqual(config.controlTargets, []);
   assert.equal(config.gpuQueue.enabled, false);
-  assert.equal(config.gpuQueue.schedulerMonitorPidFile, '/tmp/gpu_scheduler_global_monitor.pid');
+  assert.equal(config.gpuQueue.runnerEnsureEnabled, true);
+  assert.equal(config.gpuQueue.schedulerMonitorPidFile, null);
   assert.equal(config.scanIntervalMs, 2.5 * 60 * 60 * 1000);
-  assert.deepEqual(config.professor, {
-    mode: 'stateless-codex',
-    intervalMs: 2.5 * 60 * 60 * 1000,
-  });
+  assert.equal(config.continuity.enabled, false);
+  assert.equal(config.continuity.codexExecutable, null);
 });
 
 test('GPU Scheduler prompt requires one persistent deduplicated global monitor', async () => {
