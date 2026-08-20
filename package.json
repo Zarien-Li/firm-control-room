@@ -1,7 +1,7 @@
 {
   "name": "firm-control-room",
   "version": "0.1.0",
-  "description": "A local control plane for running, observing, and safely steering multiple Claude Code research sessions.",
+  "description": "A local operations plane for observing research sessions, reconciling jobs, and delivering bounded facts.",
   "private": true,
   "license": "MIT",
   "repository": {

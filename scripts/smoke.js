@@ -34,8 +34,10 @@ try {
   const healthResponse = await fetch(`${base}/api/health`);
   assert.equal(healthResponse.status, 200);
   const health = await healthResponse.json();
-  assert.equal(health.mode, 'shadow-read-only');
+  assert.equal(health.mode, 'operations-only');
   assert.equal(health.autoCorrection, false);
+  assert.equal(health.scientificAuthority, 'external-only');
+  assert.equal(health.automation.researchMessageAuthority, false);
   assert.equal(health.projectCount, 5);
 
   const scanResponse = await fetch(`${base}/api/scan`, { method: 'POST' });

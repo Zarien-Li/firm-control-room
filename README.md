@@ -21,6 +21,19 @@ Opening more terminals is easy. Knowing whether nine research agents are genuine
 
 FIRM turns those hidden states into an evidence-backed control plane. It combines the Claude history stream, terminal state, process tree, project artifacts, a durable Job Registry, optional GPU queue signals, and an optional event-driven Continuity PI. The Continuity PI resumes genuinely idle research turns; it is separate from scientific portfolio review and is forbidden to invent a replacement method or change a paper's direction.
 
+### Default authority mode
+
+The public default is **operations-only**: `FIRM_CONTINUITY_ENABLED=false`. In this
+mode FIRM may observe sessions, reconcile jobs and resources, and deliver allowlisted
+operational facts, but it does not call Codex, answer stopped prompts, judge project
+value, choose a research route, or review papers. An external scheduled PI/reviewer may
+use FIRM's facts, but remains a separate process with its own policy and audit trail.
+
+Enabling Continuity PI changes only the narrow stopped-prompt behavior documented
+below. It does not grant FIRM scientific portfolio authority and must not be used as a
+second reviewer. Current research policy, including sparse late-stage Codex review,
+belongs to the research skills and the lead PI rather than this control room.
+
 ## Why FIRM
 
 | Without a control plane | With FIRM |
@@ -194,6 +207,7 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 | `FIRM_BROKER_SOCKET` | `<data-dir>/control-plane/broker.sock` | Stable Unix socket for the persistent PTY broker |
 | `FIRM_BROKER_AUTOSTART` | `true` | Development fallback; the macOS service sets this to `false` and uses a separate broker LaunchAgent |
 | `FIRM_SCAN_INTERVAL_MS` | `9000000` | Periodic read-only evidence snapshot interval |
+| `FIRM_CONTINUITY_ENABLED` | `false` | Opt into bounded idle-prompt continuity; disabled operations-only mode never calls Codex |
 | `FIRM_GPU_QUEUE_ENABLED` | `false` | Enable remote queue collection |
 | `FIRM_GPU_SCHEDULER_AUTO_START` | `false` | Allow a configured scheduler target to start for new requests |
 | `FIRM_DATA_DIR` | `./var` | Local runtime database, evidence, and transcripts |
