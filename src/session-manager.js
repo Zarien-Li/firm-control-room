@@ -104,12 +104,17 @@ export class SessionManager {
     const targetArgs = Array.isArray(project.args) ? [...project.args] : [...this.args];
     const bootstrapFile = project.bootstrapFile || 'prompt.txt';
     const bootstrapBasePath = project.bootstrapBasePath || project.path;
+    const systemPromptFlag = targetArgs.indexOf('--append-system-prompt-file');
+    const systemPromptPath = systemPromptFlag >= 0 ? targetArgs[systemPromptFlag + 1] : null;
     const requiredFiles = project.bootstrapRequiredFiles
-      || ['CLAUDE-RESEARCH.md', bootstrapFile];
+      || [systemPromptPath, bootstrapFile].filter(Boolean);
     const bootstrapEnabled = dimensions.bootstrap === true;
     let bootstrapPrompt = null;
     if (bootstrapEnabled) {
-      const missing = requiredFiles.filter((name) => !existsSync(join(bootstrapBasePath, name)));
+      const resolveBootstrapPath = (name) => (
+        isAbsolute(name) ? name : join(bootstrapBasePath, name)
+      );
+      const missing = requiredFiles.filter((name) => !existsSync(resolveBootstrapPath(name)));
       const promptPath = join(bootstrapBasePath, bootstrapFile);
       if (missing.length) {
         throw new SessionError(

@@ -144,7 +144,11 @@ export async function loadConfig() {
     .filter(Boolean)
     .map((path) => resolve(expand(path)));
   const resolvedControlPaths = controlSessionPaths.length ? controlSessionPaths : defaultControlPaths;
-  const claudeArgs = ['--append-system-prompt-file', 'CLAUDE-RESEARCH.md'];
+  const researchPromptPath = resolve(expand(
+    process.env.FIRM_RESEARCH_PROMPT_PATH
+      || join(homedir(), '.claude', 'CLAUDE-RESEARCH.md'),
+  ));
+  const claudeArgs = ['--append-system-prompt-file', researchPromptPath];
   const gpuSchedulerArgs = [
     '--effort',
     'low',
@@ -177,7 +181,7 @@ export async function loadConfig() {
       args: claudeArgs,
       bootstrapFile: project.bootstrapFile || 'prompt.txt',
       bootstrapRequiredFiles: [
-        'CLAUDE-RESEARCH.md',
+        researchPromptPath,
         project.bootstrapFile || 'prompt.txt',
       ],
     })),
@@ -206,6 +210,7 @@ export async function loadConfig() {
     scanIntervalMs,
     claudeExecutable,
     claudeArgs,
+    researchPromptPath,
     claudeProjectsDir: resolve(process.env.FIRM_CLAUDE_PROJECTS_DIR
       || join(homedir(), '.claude', 'projects')),
     gpuQueue: {

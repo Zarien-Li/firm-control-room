@@ -1,17 +1,21 @@
 import { constants } from 'node:fs';
 import { access, readFile, stat } from 'node:fs/promises';
+import { homedir } from 'node:os';
 import { delimiter, dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const REQUIRED_PROJECT_FILES = [
-  'CLAUDE-RESEARCH.md',
   'PROJECT_IDENTITY.json',
   'PROGRAM_ORIGIN.md',
   'SEED.md',
   'PIPELINE_STATE.md',
   'CLAUDE.md',
 ];
+const researchPromptPath = resolve(
+  process.env.FIRM_RESEARCH_PROMPT_PATH
+    || join(homedir(), '.claude', 'CLAUDE-RESEARCH.md'),
+);
 
 async function executable(name) {
   for (const directory of String(process.env.PATH || '').split(delimiter).filter(Boolean)) {
@@ -57,6 +61,12 @@ for (const command of ['claude']) {
     fix: 'Install and log in to Claude Code.',
   });
 }
+
+checks.push({
+  ok: await exists(researchPromptPath),
+  label: `Research runtime prompt: ${researchPromptPath}`,
+  fix: 'Install FIRM skills or set FIRM_RESEARCH_PROMPT_PATH to the canonical prompt.',
+});
 
 const configPath = resolve(process.env.FIRM_CONFIG || join(ROOT, 'config', 'projects.json'));
 if (!(await exists(configPath))) {
