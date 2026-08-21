@@ -81,12 +81,15 @@ cp -R examples/research-project "$HOME/research/project-alpha"
 cp config/projects.example.json config/projects.json
 ```
 
+Install one canonical research runtime prompt at `~/.claude/CLAUDE-RESEARCH.md`
+(the FIRM skills installer does this). FIRM passes this absolute user-level path to
+Claude Code so projects cannot silently retain stale prompt copies.
+
 Edit `config/projects.json` when your project has a different name or location. Then replace the placeholders in:
 
 ```text
 ~/research/project-alpha/
 ├── CLAUDE.md
-├── CLAUDE-RESEARCH.md
 ├── PROGRAM_ORIGIN.md
 ├── PROJECT_IDENTITY.json
 ├── SEED.md
@@ -200,6 +203,7 @@ Start from [.env.example](.env.example), but export variables in your shell or p
 |---|---:|---|
 | `RESEARCH_PROJECT_ROOT` | `~/research` | Root used by `${RESEARCH_PROJECT_ROOT}` in project config |
 | `FIRM_CONFIG` | `config/projects.json` | Project configuration file |
+| `FIRM_RESEARCH_PROMPT_PATH` | `~/.claude/CLAUDE-RESEARCH.md` | Canonical absolute research runtime prompt shared by every project |
 | `FIRM_HOST` | `127.0.0.1` | Local bind address |
 | `FIRM_PORT` | `8787` | Dashboard port |
 | `FIRM_SCAN_RETENTION` | `50` | Maximum bulky raw control-room snapshots retained locally |

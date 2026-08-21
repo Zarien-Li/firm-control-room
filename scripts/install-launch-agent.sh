@@ -47,6 +47,8 @@ rsync -a --delete \
   --exclude .git \
   "$REPO/" "$RUNTIME/"
 
+touch "$RUNTIME/.env.local"
+
 chmod +x \
   "$RUNTIME/scripts/firm-supervisor.command" \
   "$RUNTIME/scripts/firm-broker.command"
@@ -75,10 +77,38 @@ set_env FIRM_GPU_SNAPSHOT_RETENTION 200 "$RUNTIME/.env.local"
 set_env FIRM_GPU_SCHEDULER_AUTO_START true "$RUNTIME/.env.local"
 set_env FIRM_GPU_QUEUE_RUNNER_ENSURE true "$RUNTIME/.env.local"
 
+# Machine-local settings are intentionally ignored by Git. Reapply them after
+# every upgrade so portable defaults never overwrite host-specific paths or credentials.
+if [[ -f "$REPO/local/runtime.env" ]]; then
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    [[ -z "$line" || "$line" == \#* ]] && continue
+    key="${line%%=*}"
+    value="${line#*=}"
+    [[ "$key" =~ ^[A-Z][A-Z0-9_]*$ ]] || {
+      echo "Invalid local runtime setting: $key" >&2
+      exit 1
+    }
+    set_env "$key" "$value" "$RUNTIME/.env.local"
+  done < "$REPO/local/runtime.env"
+fi
+
 "$NODE" --env-file="$RUNTIME/.env.local" "$RUNTIME/scripts/compact-history.js"
 
 sed "s|__HOME__|$HOME|g" "$WEB_SOURCE" > "$WEB_TARGET"
 sed "s|__HOME__|$HOME|g" "$BROKER_SOURCE" > "$BROKER_TARGET"
+
+# launchd does not inherit an interactive Homebrew/nvm PATH. Persist the exact
+# executable selected above so Web and Broker restart with the tested Node runtime.
+set_launchd_env() {
+  local plist="$1"
+  local key="$2"
+  local value="$3"
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables dict" "$plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Delete :EnvironmentVariables:${key}" "$plist" 2>/dev/null || true
+  /usr/libexec/PlistBuddy -c "Add :EnvironmentVariables:${key} string ${value}" "$plist"
+}
+set_launchd_env "$WEB_TARGET" FIRM_NODE_EXECUTABLE "$NODE"
+set_launchd_env "$BROKER_TARGET" FIRM_NODE_EXECUTABLE "$NODE"
 chmod 600 "$WEB_TARGET" "$BROKER_TARGET"
 
 bootstrap() {

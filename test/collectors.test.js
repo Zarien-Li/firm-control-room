@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { mkdtemp, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
-import { tmpdir } from 'node:os';
+import { homedir, tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
 import {
@@ -16,7 +16,9 @@ test('public default config falls back to the portable example project', async (
   const config = await loadConfig();
   assert.deepEqual(config.projects.map((project) => project.id), ['project-alpha']);
   assert.match(config.projects[0].path, /research\/project-alpha$/);
-  assert.deepEqual(config.claudeArgs, ['--append-system-prompt-file', 'CLAUDE-RESEARCH.md']);
+  const researchPromptPath = join(homedir(), '.claude', 'CLAUDE-RESEARCH.md');
+  assert.deepEqual(config.claudeArgs, ['--append-system-prompt-file', researchPromptPath]);
+  assert.equal(config.researchPromptPath, researchPromptPath);
   assert.equal(config.sessionTargets.length, 1);
   assert.deepEqual(config.controlTargets, []);
   assert.equal(config.gpuQueue.enabled, false);

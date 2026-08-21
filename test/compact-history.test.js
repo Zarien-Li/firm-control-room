@@ -9,6 +9,23 @@ import test from 'node:test';
 
 const execFileAsync = promisify(execFile);
 
+test('history compaction is safe before the service creates its schema', async () => {
+  const dataDir = await mkdtemp(join(tmpdir(), 'firm-compact-empty-history-'));
+  const empty = new DatabaseSync(join(dataDir, 'history.sqlite'));
+  empty.close();
+  try {
+    const { stdout } = await execFileAsync(process.execPath, ['scripts/compact-history.js'], {
+      cwd: join(import.meta.dirname, '..'),
+      env: { ...process.env, FIRM_DATA_DIR: dataDir },
+    });
+    const result = JSON.parse(stdout);
+    assert.equal(result.scansDeleted, 0);
+    assert.equal(result.gpuSnapshotsDeleted, 0);
+  } finally {
+    await rm(dataDir, { recursive: true, force: true });
+  }
+});
+
 test('history compaction supports the current schema without legacy semantic audits', async () => {
   const dataDir = await mkdtemp(join(tmpdir(), 'firm-compact-history-'));
   const databasePath = join(dataDir, 'history.sqlite');

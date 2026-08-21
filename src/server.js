@@ -117,7 +117,7 @@ export async function createApp(overrides = {}) {
       args: project.args || config.claudeArgs,
       bootstrapFile: project.bootstrapFile || 'prompt.txt',
       bootstrapRequiredFiles: project.bootstrapRequiredFiles
-        || ['CLAUDE-RESEARCH.md', project.bootstrapFile || 'prompt.txt'],
+        || [config.researchPromptPath, project.bootstrapFile || 'prompt.txt'].filter(Boolean),
     }));
   }
   const store = await createStore(config.dataDir, {

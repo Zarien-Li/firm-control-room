@@ -1,5 +1,5 @@
 This is a fresh research session. Read CLAUDE.md, PROGRAM_ORIGIN.md, PROJECT_IDENTITY.json, SEED.md,
-PIPELINE_STATE.md, CLAUDE-RESEARCH.md, and the active research skills. Continue as the project PI from
+PIPELINE_STATE.md, ~/.claude/CLAUDE-RESEARCH.md, and the active research skills. Continue as the project PI from
 the current trustworthy evidence through problem discovery, method formation, evaluation, claim
 consolidation, and paper preparation. Keep the original program visible, do not inherit unsupported stop
 language or candidate-method inertia, and do not return routine experiment choices to the user.

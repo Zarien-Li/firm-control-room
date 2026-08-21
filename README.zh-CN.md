@@ -61,12 +61,15 @@ cp -R examples/research-project "$HOME/research/project-alpha"
 cp config/projects.example.json config/projects.json
 ```
 
+请先把唯一的研究运行时 prompt 安装到 `~/.claude/CLAUDE-RESEARCH.md`（FIRM skills
+安装器会自动完成）。FIRM 始终把这个用户级绝对路径传给 Claude Code，各项目不再保存
+可能过期的 prompt 副本。
+
 在模板文件中替换研究对象、价值指标、Seed 和当前状态。若目录或名称不同，再修改 `config/projects.json`。
 
 ```text
 ~/research/project-alpha/
 ├── CLAUDE.md
-├── CLAUDE-RESEARCH.md
 ├── PROGRAM_ORIGIN.md
 ├── PROJECT_IDENTITY.json
 ├── SEED.md

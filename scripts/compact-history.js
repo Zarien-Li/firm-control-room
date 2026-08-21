@@ -14,24 +14,29 @@ const gpuSnapshots = Math.max(20, Number(process.env.FIRM_GPU_SNAPSHOT_RETENTION
 const db = new DatabaseSync(databasePath);
 try {
   db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;');
-  const hasLegacySemanticAudits = Boolean(db.prepare(`
-    SELECT 1 FROM sqlite_master
-    WHERE type = 'table' AND name = 'semantic_audits'
-  `).get());
-  const scanDelete = db.prepare(hasLegacySemanticAudits ? `
-    DELETE FROM scans
-    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
-      AND id NOT IN (SELECT scan_id FROM semantic_audits WHERE scan_id IS NOT NULL)
-  ` : `
-    DELETE FROM scans
-    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
-  `).run(scans);
-  const gpuDelete = db.prepare(`
-    DELETE FROM gpu_queue_snapshots
-    WHERE id NOT IN (
-      SELECT id FROM gpu_queue_snapshots ORDER BY id DESC LIMIT ?
-    )
-  `).run(gpuSnapshots);
+  const tables = new Set(db.prepare(
+    "SELECT name FROM sqlite_master WHERE type = 'table'",
+  ).all().map((row) => row.name));
+  let scanDelete = { changes: 0 };
+  let gpuDelete = { changes: 0 };
+  if (tables.has('scans')) {
+    const legacyAuditGuard = tables.has('semantic_audits')
+      ? 'AND id NOT IN (SELECT scan_id FROM semantic_audits WHERE scan_id IS NOT NULL)'
+      : '';
+    scanDelete = db.prepare(`
+      DELETE FROM scans
+      WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
+        ${legacyAuditGuard}
+    `).run(scans);
+  }
+  if (tables.has('gpu_queue_snapshots')) {
+    gpuDelete = db.prepare(`
+      DELETE FROM gpu_queue_snapshots
+      WHERE id NOT IN (
+        SELECT id FROM gpu_queue_snapshots ORDER BY id DESC LIMIT ?
+      )
+    `).run(gpuSnapshots);
+  }
   db.exec('COMMIT; PRAGMA wal_checkpoint(TRUNCATE);');
   const pageCount = Number(db.prepare('PRAGMA page_count').get().page_count);
   const freePages = Number(db.prepare('PRAGMA freelist_count').get().freelist_count);
