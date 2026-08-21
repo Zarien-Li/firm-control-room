@@ -78,6 +78,60 @@ test('raw scan and GPU snapshot history stays within configured retention', asyn
   }
 });
 
+test('online history pruning preserves legacy semantic-audit scan references', async () => {
+  const directory = await mkdtemp(join(tmpdir(), 'firm-legacy-retention-'));
+  const databasePath = join(directory, 'history.sqlite');
+  let store;
+  const db = new DatabaseSync(databasePath);
+  try {
+    db.exec(`
+      PRAGMA foreign_keys = ON;
+      CREATE TABLE scans (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        collected_at TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+        snapshot_json TEXT NOT NULL,
+        audit_json TEXT NOT NULL,
+        evidence_hash TEXT NOT NULL UNIQUE,
+        evidence_path TEXT NOT NULL
+      );
+      CREATE TABLE semantic_audits (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        scan_id INTEGER,
+        FOREIGN KEY(scan_id) REFERENCES scans(id)
+      );
+    `);
+    const insertScan = db.prepare(`
+      INSERT INTO scans
+        (collected_at, snapshot_json, audit_json, evidence_hash, evidence_path)
+      VALUES (?, '{}', '{}', ?, ?)
+    `);
+    for (let index = 0; index < 15; index += 1) {
+      insertScan.run(`scan-${index}`, `hash-${index}`, `evidence-${index}`);
+    }
+    db.prepare('INSERT INTO semantic_audits (scan_id) VALUES (1)').run();
+  } finally {
+    db.close();
+  }
+
+  try {
+    store = await createStore(directory, { scanRetention: 10 });
+    assert.doesNotThrow(() => store.pruneHistory());
+    store.close();
+    store = null;
+    const compacted = new DatabaseSync(databasePath, { readOnly: true });
+    try {
+      assert.equal(compacted.prepare('SELECT COUNT(*) AS count FROM scans').get().count, 11);
+      assert.equal(compacted.prepare('SELECT COUNT(*) AS count FROM scans WHERE id = 1').get().count, 1);
+    } finally {
+      compacted.close();
+    }
+  } finally {
+    store?.close();
+    await rm(directory, { recursive: true, force: true });
+  }
+});
+
 test('message outbox persists ACK evidence and quarantines an interrupted send on restart', async () => {
   const directory = await mkdtemp(join(tmpdir(), 'firm-outbox-restart-'));
   let store;

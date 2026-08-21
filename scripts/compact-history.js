@@ -14,10 +14,17 @@ const gpuSnapshots = Math.max(20, Number(process.env.FIRM_GPU_SNAPSHOT_RETENTION
 const db = new DatabaseSync(databasePath);
 try {
   db.exec('PRAGMA busy_timeout = 5000; PRAGMA foreign_keys = ON; BEGIN IMMEDIATE;');
-  const scanDelete = db.prepare(`
+  const hasLegacySemanticAudits = Boolean(db.prepare(`
+    SELECT 1 FROM sqlite_master
+    WHERE type = 'table' AND name = 'semantic_audits'
+  `).get());
+  const scanDelete = db.prepare(hasLegacySemanticAudits ? `
     DELETE FROM scans
     WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
       AND id NOT IN (SELECT scan_id FROM semantic_audits WHERE scan_id IS NOT NULL)
+  ` : `
+    DELETE FROM scans
+    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
   `).run(scans);
   const gpuDelete = db.prepare(`
     DELETE FROM gpu_queue_snapshots

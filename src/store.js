@@ -171,7 +171,15 @@ export async function createStore(dataDir, options = {}) {
     FROM scans ORDER BY id DESC LIMIT ?
   `);
   const get = db.prepare('SELECT * FROM scans WHERE id = ?');
-  const pruneScans = db.prepare(`
+  const hasLegacySemanticAudits = Boolean(db.prepare(`
+    SELECT 1 FROM sqlite_master
+    WHERE type = 'table' AND name = 'semantic_audits'
+  `).get());
+  const pruneScans = db.prepare(hasLegacySemanticAudits ? `
+    DELETE FROM scans
+    WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
+      AND id NOT IN (SELECT scan_id FROM semantic_audits WHERE scan_id IS NOT NULL)
+  ` : `
     DELETE FROM scans
     WHERE id NOT IN (SELECT id FROM scans ORDER BY id DESC LIMIT ?)
   `);
